@@ -1,0 +1,8 @@
+[package]
+name = "scout"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.30.2"
+sled = "0.34.7"

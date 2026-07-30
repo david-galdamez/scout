@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::Result;
 
 mod config;
@@ -8,7 +10,17 @@ mod tui;
 
 fn main() -> Result<()> {
     let config = config::load_and_validate_config()?;
-    println!("{:?}", config.indexing.include);
-    println!("{:?}", config.indexing.exclude);
+
+    let errors = indexer::walk_dirs(
+        config.indexing.include,
+        config
+            .indexing
+            .exclude
+            .into_iter()
+            .collect::<HashSet<String>>(),
+    )?;
+
+    println!("Errors encountered during directory walk: {:?}", errors);
+
     Ok(())
 }

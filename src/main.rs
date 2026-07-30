@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 mod config;
+mod database;
 mod indexer;
 mod search;
 mod tui;

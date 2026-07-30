@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::ConfigError;
 
 // Represents the type of file being indexed.
-#[derive(Debug, Serialize, Deserialize)]
-enum FileType {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileType {
     Binary,
     Image,
     Text,

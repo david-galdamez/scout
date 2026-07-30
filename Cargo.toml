@@ -11,3 +11,4 @@ ratatui = "0.30.2"
 sled = "0.34.7"
 toml = "1.1.4"
 serde = { version = "1.0.229", features = ["derive"] }
+unicode-normalization = "0.1.25"

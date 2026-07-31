@@ -37,6 +37,11 @@ impl Config {
         let config_dir = home_path.join(".scout.toml");
         Ok(config_dir)
     }
+
+    pub fn default_db_path() -> Result<PathBuf, ConfigError> {
+        let db_path = dirs::data_dir().ok_or(ConfigError::HomeDirNotFound)?;
+        Ok(db_path.join("scout").join("index.db"))
+    }
 }
 
 // Loads the configuration from the specified path, creates the file with default configuration if it doesn't exist, and validates the configuration.

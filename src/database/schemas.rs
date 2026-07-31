@@ -45,8 +45,3 @@ struct TermFrequency {
 struct Stats {
     total_docs: u64,
 }
-
-fn default_db_path() -> Result<PathBuf, ConfigError> {
-    let db_path = dirs::data_dir().ok_or(ConfigError::HomeDirNotFound)?;
-    Ok(db_path.join("scout").join("index.db"))
-}

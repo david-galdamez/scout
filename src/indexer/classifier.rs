@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::{database::FileType, indexer::extension_map::EXTENSION_MAP};
 
 #[derive(Debug, Error)]
-enum ClassifierError {
+pub enum ClassifierError {
     #[error("I/O error: {0}")]
     FilerError(#[from] io::Error),
 }
@@ -28,15 +28,12 @@ pub fn classify(path: &Path) -> Result<FileType, ClassifierError> {
 }
 
 fn inspect_file(path: &Path) -> Result<FileType, ClassifierError> {
-    let file = File::open(path)?;
+    let mut file = File::open(path)?;
     let mut buffer = [0; 8192];
 
-    let mut handler = file.take(8192);
+    let bytes_read = file.read(&mut buffer)?;
 
-    handler.read(&mut buffer)?;
-    let content_type = inspect(&buffer);
-
-    if content_type.is_text() {
+    if inspect(&buffer[..bytes_read]).is_text() {
         Ok(FileType::Text)
     } else {
         Ok(FileType::Binary)

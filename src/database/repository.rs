@@ -1,6 +1,9 @@
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
-use sled::{Db, Error as SledError, Tree, open};
+use sled::{
+    Db, Error as SledError, Tree, open,
+    transaction::{ConflictableTransactionError, TransactionError, Transactional},
+};
 use thiserror::Error;
 
 use crate::database::schemas::{Metadata, TermFrequency};
@@ -33,6 +36,18 @@ impl From<SledError> for DatabaseError {
     }
 }
 
+// `Conflict` is sled's internal retry signal for the *inside* of the closure
+// (`ConflictableTransactionError`) and never escapes `.transaction(...)`. What
+// comes back out is `TransactionError<E>`, which only has `Abort`/`Storage`.
+impl From<TransactionError<DatabaseError>> for DatabaseError {
+    fn from(err: TransactionError<DatabaseError>) -> Self {
+        match err {
+            TransactionError::Abort(e) => e,
+            TransactionError::Storage(e) => DatabaseError::from(e),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Database {
     db: Db,
@@ -59,69 +74,74 @@ impl Database {
         })
     }
 
-    // Inserts metadata into the database and returns the generated document ID.
-    pub fn insert_metadata(&self, metadata: &Metadata) -> Result<u64, DatabaseError> {
-        //we create the document ID for the metadata entry that would be used to reference the metadata entry in the file_names and terms trees
+    // Indexes a document by inserting its metadata, file name, and term frequencies into the database.
+    // All writes happen inside a single sled transaction: either everything commits or nothing does.
+    pub fn index_document(
+        &self,
+        metadata: Metadata,
+        file_name: &str,
+        term_counts: HashMap<&str, u64>,
+    ) -> Result<u64, DatabaseError> {
+        // generate_id() is its own atomic counter, unrelated to the tree transaction below,
+        // and the closure can retry on conflict — so we compute doc_id and serialize the
+        // metadata once, outside the closure, instead of burning ids/doing extra work per retry.
         let doc_id = self.db.generate_id()?;
-        let metadata_bytes = serde_json::to_vec(metadata)?;
+        let metadata_bytes = serde_json::to_vec(&metadata)?;
+        let doc_length = metadata.doc_length;
 
-        self.metadata.insert(doc_id.to_be_bytes(), metadata_bytes)?;
+        (&self.metadata, &self.file_names, &self.terms, &self.stats).transaction(
+            |(metadata_tree, file_names_tree, terms_tree, stats_tree)| {
+                metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
+
+                let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
+                    Some(bytes) => serde_json::from_slice(&bytes)
+                        .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?,
+                    None => Vec::new(),
+                };
+                doc_ids.push(doc_id);
+                let ids_bytes = serde_json::to_vec(&doc_ids)
+                    .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+                file_names_tree.insert(file_name.as_bytes(), ids_bytes)?;
+
+                for (term, count) in term_counts.iter() {
+                    let mut freqs: Vec<TermFrequency> = match terms_tree.get(*term)? {
+                        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                            ConflictableTransactionError::Abort(DatabaseError::from(e))
+                        })?,
+                        None => Vec::new(),
+                    };
+                    freqs.push(TermFrequency {
+                        doc_id,
+                        frequency: *count,
+                    });
+                    let freqs_bytes = serde_json::to_vec(&freqs)
+                        .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+                    terms_tree.insert(term.as_bytes(), freqs_bytes)?;
+                }
+
+                let n_docs = match stats_tree.get("n_docs")? {
+                    Some(bytes) => u64::from_be_bytes(
+                        bytes.as_ref().try_into().expect("n_docs should be 8 bytes"),
+                    ),
+                    None => 0,
+                };
+                stats_tree.insert("n_docs", (n_docs + 1).to_be_bytes().to_vec())?;
+
+                let n_terms = match stats_tree.get("n_terms")? {
+                    Some(bytes) => u64::from_be_bytes(
+                        bytes
+                            .as_ref()
+                            .try_into()
+                            .expect("n_terms should be 8 bytes"),
+                    ),
+                    None => 0,
+                };
+                stats_tree.insert("n_terms", (n_terms + doc_length).to_be_bytes().to_vec())?;
+
+                Ok(())
+            },
+        )?;
+
         Ok(doc_id)
-    }
-
-    // Inserts file name and his document ID into the database. If the file name already exists, it appends the new document ID to the existing list of document IDs
-    // If the file name does not exist, it creates a new entry with the file name and the document ID
-    pub fn insert_file_name(&self, file_name: &str, doc_id: u64) -> Result<(), DatabaseError> {
-        let mut documents_ids: Vec<u64> = match self.file_names.get(file_name)? {
-            Some(ids) => serde_json::from_slice(&ids)?,
-            None => Vec::new(),
-        };
-        documents_ids.push(doc_id);
-
-        let ids_bytes = serde_json::to_vec(&documents_ids)?;
-        self.file_names.insert(file_name, ids_bytes)?;
-
-        Ok(())
-    }
-
-    // Inserts a term's frequency for a given document. The caller is responsible for
-    // counting occurrences within the document beforehand (one call per unique term per doc).
-    pub fn insert_term(&self, term: &str, frequency: TermFrequency) -> Result<(), DatabaseError> {
-        let mut term_frequencies: Vec<TermFrequency> = match self.terms.get(term)? {
-            Some(freqs) => serde_json::from_slice(&freqs)?,
-            None => Vec::new(),
-        };
-        term_frequencies.push(frequency);
-
-        let freqs_bytes = serde_json::to_vec(&term_frequencies)?;
-        self.terms.insert(term, freqs_bytes)?;
-
-        Ok(())
-    }
-
-    // Increments the document counter in the stats tree. If the counter does not exist, it initializes it to 1.
-    pub fn increment_document_counter_stats(&self) -> Result<(), DatabaseError> {
-        self.stats.update_and_fetch("n_docs", |old| {
-            let count = old
-                .map(|bytes| {
-                    u64::from_be_bytes(bytes.try_into().expect("n_docs should be 8 bytes"))
-                })
-                .unwrap_or(0);
-            Some((count + 1).to_be_bytes().to_vec())
-        })?;
-        Ok(())
-    }
-
-    // Increments the total terms counter in the stats tree by a given count. If the counter does not exist, it initializes it to the given count.
-    pub fn increment_total_terms_stats(&self, count: u64) -> Result<(), DatabaseError> {
-        self.stats.update_and_fetch("n_terms", |old| {
-            let total = old
-                .map(|bytes| {
-                    u64::from_be_bytes(bytes.try_into().expect("n_terms should be 8 bytes"))
-                })
-                .unwrap_or(0);
-            Some((total + count).to_be_bytes().to_vec())
-        })?;
-        Ok(())
     }
 }

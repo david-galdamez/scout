@@ -6,6 +6,11 @@ use std::{
 use thiserror::Error;
 use walkdir::WalkDir;
 
+use crate::{
+    database::{Database, FileType},
+    indexer::{classifier::classify, processors::process_text_file},
+};
+
 #[derive(Debug, Error)]
 pub enum DirErrors {
     #[error("Not a directory: {0}")]
@@ -18,11 +23,14 @@ pub enum DirErrors {
     IoError(#[from] std::io::Error),
     #[error("Symlink loop detected")]
     SymlinkLoop,
+    #[error("Database error: {0}")]
+    DatabaseError(#[from] crate::database::DatabaseError),
 }
 
 pub fn walk_dirs(
     dirs: Vec<PathBuf>,
     exclude: HashSet<String>,
+    db: &Database,
 ) -> Result<Vec<(PathBuf, DirErrors)>, DirErrors> {
     let mut errors = Vec::new();
 
@@ -39,7 +47,16 @@ pub fn walk_dirs(
             match entry {
                 Ok(entry) => {
                     if entry.file_type().is_file() {
-                        println!("{}", entry.path().display());
+                        match classify(entry.path()) {
+                            Ok(FileType::Text) => {
+                                if let Err(e) = process_text_file(entry.path(), db) {
+                                    errors.push((entry.path().to_path_buf(), e));
+                                }
+                            }
+                            Ok(FileType::Binary) => {}
+                            Ok(FileType::Image) => {}
+                            Err(e) => errors.push((entry.path().to_path_buf(), e)),
+                        }
                     }
                 }
                 Err(e) => {

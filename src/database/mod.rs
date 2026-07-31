@@ -1,4 +1,5 @@
 mod repository;
 mod schemas;
 
-pub use schemas::FileType;
+pub use repository::{Database, DatabaseError};
+pub use schemas::{FileType, Metadata};

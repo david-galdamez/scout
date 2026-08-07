@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{File, metadata},
     io::{BufRead, BufReader},
     os::unix::fs::MetadataExt,
     path::Path,
@@ -8,7 +8,10 @@ use std::{
 
 use crate::{
     database::{Database, FileType, Metadata},
-    indexer::{file_walker::DirErrors, tokenizer::tokenizer},
+    indexer::{
+        file_walker::DirErrors,
+        tokenizer::{normalize_file_name, tokenizer},
+    },
 };
 
 // Processes a text file, tokenizes its content, and indexes it in the database.
@@ -43,14 +46,42 @@ pub fn process_text_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
         *count = count.saturating_add(1);
     }
 
-    db.index_document(
-        &metadata,
+    let file_name = normalize_file_name(
         path.file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .as_ref(),
-        &counts,
-    )?;
+    );
+
+    db.index_document(&metadata, &file_name, &counts)?;
+
+    Ok(())
+}
+
+// Processes a binary and image and indexes it in the database.
+pub fn process_binary_and_image_file(
+    path: &Path,
+    db: &Database,
+    file_type: FileType,
+) -> Result<(), DirErrors> {
+    let file_metadata = metadata(path)?;
+
+    let metadata = Metadata {
+        path: path.to_path_buf(),
+        size: file_metadata.size(),
+        modified: file_metadata.mtime().cast_unsigned(),
+        kind: file_type,
+        doc_length: 0,
+    };
+
+    let file_name = normalize_file_name(
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .as_ref(),
+    );
+
+    db.index_binary_and_image(&metadata, &file_name)?;
 
     Ok(())
 }

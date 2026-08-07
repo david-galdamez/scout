@@ -2,11 +2,16 @@ use std::{collections::HashMap, path::Path};
 
 use sled::{
     Db, Error as SledError, Tree, open,
-    transaction::{ConflictableTransactionError, TransactionError, Transactional},
+    transaction::{
+        ConflictableTransactionError, TransactionError, Transactional, TransactionalTree,
+    },
 };
 use thiserror::Error;
 
-use crate::database::schemas::{Metadata, TermFrequency};
+use crate::database::{
+    FileType,
+    schemas::{Metadata, TermFrequency},
+};
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -129,29 +134,70 @@ impl Database {
                     terms_tree.insert(term.as_bytes(), freqs_bytes)?;
                 }
 
-                let n_docs = stats_tree
-                    .get("n_docs")?
-                    .map(|bytes| decode_u64_counter(&bytes))
-                    .transpose()
-                    .map_err(ConflictableTransactionError::Abort)?
-                    .unwrap_or(0);
-                stats_tree.insert("n_docs", n_docs.saturating_add(1).to_be_bytes().to_vec())?;
-
-                let n_terms = stats_tree
-                    .get("n_terms")?
-                    .map(|bytes| decode_u64_counter(&bytes))
-                    .transpose()
-                    .map_err(ConflictableTransactionError::Abort)?
-                    .unwrap_or(0);
-                stats_tree.insert(
-                    "n_terms",
-                    n_terms.saturating_add(doc_length).to_be_bytes().to_vec(),
-                )?;
+                Self::bump_stats(stats_tree, "n_text_docs", 1)?;
+                Self::bump_stats(stats_tree, "n_terms", doc_length)?;
 
                 Ok(())
             },
         )?;
 
         Ok(doc_id)
+    }
+
+    // Indexes a binary and an image by inserting its metadata, file name.
+    // All writes happen inside a single sled transaction: either everything commits or nothing does.
+    pub fn index_binary_and_image(
+        &self,
+        metadata: &Metadata,
+        file_name: &str,
+    ) -> Result<u64, DatabaseError> {
+        // generate_id() is its own atomic counter, unrelated to the tree transaction below,
+        // and the closure can retry on conflict — so we compute doc_id and serialize the
+        // metadata once, outside the closure, instead of burning ids/doing extra work per retry.
+        let doc_id = self.db.generate_id()?;
+        let metadata_bytes = serde_json::to_vec(metadata)?;
+
+        (&self.metadata, &self.file_names, &self.stats).transaction(
+            |(metadata_tree, file_names_tree, stats_tree)| {
+                metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
+
+                let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
+                    Some(bytes) => serde_json::from_slice(&bytes)
+                        .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?,
+                    None => Vec::new(),
+                };
+                doc_ids.push(doc_id);
+
+                let ids_bytes = serde_json::to_vec(&doc_ids)
+                    .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+                file_names_tree.insert(file_name.as_bytes(), ids_bytes)?;
+
+                match metadata.kind {
+                    FileType::Binary => Self::bump_stats(stats_tree, "n_binary_docs", 1)?,
+                    FileType::Image => Self::bump_stats(stats_tree, "n_image_docs", 1)?,
+                    FileType::Text => {}
+                }
+
+                Ok(())
+            },
+        )?;
+
+        Ok(doc_id)
+    }
+
+    // Bumps a counter in the stats tree by a given amount. If the key doesn't exist, it initializes it to 0 before adding.
+    fn bump_stats(
+        stats_tree: &TransactionalTree,
+        key: &str,
+        counter: u64,
+    ) -> Result<(), ConflictableTransactionError<DatabaseError>> {
+        let n_docs = stats_tree
+            .get(key)?
+            .map(|bytes| decode_u64_counter(&bytes))
+            .transpose()
+            .map_err(ConflictableTransactionError::Abort)?
+            .unwrap_or(0);
+        stats_tree.insert(key, n_docs.saturating_add(counter).to_be_bytes().to_vec())?;
+        Ok(())
     }
 }

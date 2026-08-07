@@ -29,6 +29,13 @@ pub fn tokenizer(text: &str) -> Vec<String> {
         .collect()
 }
 
+// Normalizes a file name by removing non-alphanumeric characters and replacing them with underscores.
+pub fn normalize_file_name(file_name: &str) -> String {
+    let text = strip_accents(file_name);
+
+    text.to_lowercase()
+}
+
 fn strip_accents(s: &str) -> String {
     s.nfd()
         .filter(|c| !is_combining_mark(*c))

@@ -8,7 +8,10 @@ use walkdir::WalkDir;
 
 use crate::{
     database::{Database, FileType},
-    indexer::{classifier::classify, processors::process_text_file},
+    indexer::{
+        classifier::classify,
+        processors::{process_binary_and_image_file, process_text_file},
+    },
 };
 
 #[derive(Debug, Error)]
@@ -53,7 +56,13 @@ pub fn walk_dirs(
                                     errors.push((entry.path().to_path_buf(), e));
                                 }
                             }
-                            Ok(FileType::Binary | FileType::Image) => {}
+                            Ok(file_type @ (FileType::Binary | FileType::Image)) => {
+                                if let Err(e) =
+                                    process_binary_and_image_file(entry.path(), db, file_type)
+                                {
+                                    errors.push((entry.path().to_path_buf(), e));
+                                }
+                            }
                             Err(e) => errors.push((entry.path().to_path_buf(), e)),
                         }
                     }

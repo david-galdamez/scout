@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{File, metadata},
     io::{BufRead, BufReader},
     os::unix::fs::MetadataExt,
@@ -52,8 +52,14 @@ pub fn process_text_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
             .to_string_lossy()
             .as_ref(),
     );
+    let file_name_tokens = tokenizer(&file_name);
 
-    db.index_document(&metadata, &file_name, &counts)?;
+    db.index_document(
+        &metadata,
+        &file_name,
+        &counts,
+        &file_name_tokens.into_iter().collect::<HashSet<String>>(),
+    )?;
 
     Ok(())
 }
@@ -80,8 +86,13 @@ pub fn process_binary_and_image_file(
             .to_string_lossy()
             .as_ref(),
     );
+    let file_name_tokens = tokenizer(&file_name);
 
-    db.index_binary_and_image(&metadata, &file_name)?;
+    db.index_binary_and_image(
+        &metadata,
+        &file_name,
+        &file_name_tokens.into_iter().collect::<HashSet<String>>(),
+    )?;
 
     Ok(())
 }

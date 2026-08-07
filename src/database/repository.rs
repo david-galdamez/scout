@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use sled::{
     Db, Error as SledError, Tree, open,
@@ -69,6 +72,7 @@ pub struct Database {
     metadata: Tree,
     file_names: Tree,
     terms: Tree,
+    name_terms: Tree,
     stats: Tree,
 }
 
@@ -78,6 +82,7 @@ impl Database {
         let metadata_tree = db.open_tree("metadata")?;
         let file_names_tree = db.open_tree("file_names")?;
         let terms_tree = db.open_tree("terms")?;
+        let name_terms_tree = db.open_tree("name_terms")?;
         let stats_tree = db.open_tree("stats")?;
 
         Ok(Self {
@@ -85,6 +90,7 @@ impl Database {
             metadata: metadata_tree,
             file_names: file_names_tree,
             terms: terms_tree,
+            name_terms: name_terms_tree,
             stats: stats_tree,
         })
     }
@@ -96,6 +102,7 @@ impl Database {
         metadata: &Metadata,
         file_name: &str,
         term_counts: &HashMap<&str, u64>,
+        name_term: &HashSet<String>,
     ) -> Result<u64, DatabaseError> {
         // generate_id() is its own atomic counter, unrelated to the tree transaction below,
         // and the closure can retry on conflict — so we compute doc_id and serialize the
@@ -104,42 +111,65 @@ impl Database {
         let metadata_bytes = serde_json::to_vec(metadata)?;
         let doc_length = metadata.doc_length;
 
-        (&self.metadata, &self.file_names, &self.terms, &self.stats).transaction(
-            |(metadata_tree, file_names_tree, terms_tree, stats_tree)| {
-                metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
+        (
+            &self.metadata,
+            &self.file_names,
+            &self.terms,
+            &self.name_terms,
+            &self.stats,
+        )
+            .transaction(
+                |(metadata_tree, file_names_tree, terms_tree, name_term_tree, stats_tree)| {
+                    metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
 
-                let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
-                    Some(bytes) => serde_json::from_slice(&bytes)
-                        .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?,
-                    None => Vec::new(),
-                };
-                doc_ids.push(doc_id);
-                let ids_bytes = serde_json::to_vec(&doc_ids)
-                    .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
-                file_names_tree.insert(file_name.as_bytes(), ids_bytes)?;
-
-                for (term, count) in term_counts {
-                    let mut freqs: Vec<TermFrequency> = match terms_tree.get(*term)? {
+                    let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
                         Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
                             ConflictableTransactionError::Abort(DatabaseError::from(e))
                         })?,
                         None => Vec::new(),
                     };
-                    freqs.push(TermFrequency {
-                        doc_id,
-                        frequency: *count,
-                    });
-                    let freqs_bytes = serde_json::to_vec(&freqs)
+                    doc_ids.push(doc_id);
+                    let ids_bytes = serde_json::to_vec(&doc_ids)
                         .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
-                    terms_tree.insert(term.as_bytes(), freqs_bytes)?;
-                }
+                    file_names_tree.insert(file_name.as_bytes(), ids_bytes)?;
 
-                Self::bump_stats(stats_tree, "n_text_docs", 1)?;
-                Self::bump_stats(stats_tree, "n_terms", doc_length)?;
+                    for (term, count) in term_counts {
+                        let mut freqs: Vec<TermFrequency> = match terms_tree.get(*term)? {
+                            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                                ConflictableTransactionError::Abort(DatabaseError::from(e))
+                            })?,
+                            None => Vec::new(),
+                        };
+                        freqs.push(TermFrequency {
+                            doc_id,
+                            frequency: *count,
+                        });
+                        let freqs_bytes = serde_json::to_vec(&freqs).map_err(|e| {
+                            ConflictableTransactionError::Abort(DatabaseError::from(e))
+                        })?;
+                        terms_tree.insert(term.as_bytes(), freqs_bytes)?;
+                    }
 
-                Ok(())
-            },
-        )?;
+                    for term in name_term {
+                        let mut freqs: Vec<u64> = match name_term_tree.get(term)? {
+                            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                                ConflictableTransactionError::Abort(DatabaseError::from(e))
+                            })?,
+                            None => Vec::new(),
+                        };
+                        freqs.push(doc_id);
+                        let freqs_bytes = serde_json::to_vec(&freqs).map_err(|e| {
+                            ConflictableTransactionError::Abort(DatabaseError::from(e))
+                        })?;
+                        name_term_tree.insert(term.as_bytes(), freqs_bytes)?;
+                    }
+
+                    Self::bump_stats(stats_tree, "n_text_docs", 1)?;
+                    Self::bump_stats(stats_tree, "n_terms", doc_length)?;
+
+                    Ok(())
+                },
+            )?;
 
         Ok(doc_id)
     }
@@ -150,6 +180,7 @@ impl Database {
         &self,
         metadata: &Metadata,
         file_name: &str,
+        name_term: &HashSet<String>,
     ) -> Result<u64, DatabaseError> {
         // generate_id() is its own atomic counter, unrelated to the tree transaction below,
         // and the closure can retry on conflict — so we compute doc_id and serialize the
@@ -157,30 +188,51 @@ impl Database {
         let doc_id = self.db.generate_id()?;
         let metadata_bytes = serde_json::to_vec(metadata)?;
 
-        (&self.metadata, &self.file_names, &self.stats).transaction(
-            |(metadata_tree, file_names_tree, stats_tree)| {
-                metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
+        (
+            &self.metadata,
+            &self.file_names,
+            &self.name_terms,
+            &self.stats,
+        )
+            .transaction(
+                |(metadata_tree, file_names_tree, name_term_tree, stats_tree)| {
+                    metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
 
-                let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
-                    Some(bytes) => serde_json::from_slice(&bytes)
-                        .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?,
-                    None => Vec::new(),
-                };
-                doc_ids.push(doc_id);
+                    let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
+                        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                            ConflictableTransactionError::Abort(DatabaseError::from(e))
+                        })?,
+                        None => Vec::new(),
+                    };
+                    doc_ids.push(doc_id);
 
-                let ids_bytes = serde_json::to_vec(&doc_ids)
-                    .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
-                file_names_tree.insert(file_name.as_bytes(), ids_bytes)?;
+                    let ids_bytes = serde_json::to_vec(&doc_ids)
+                        .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+                    file_names_tree.insert(file_name.as_bytes(), ids_bytes)?;
 
-                match metadata.kind {
-                    FileType::Binary => Self::bump_stats(stats_tree, "n_binary_docs", 1)?,
-                    FileType::Image => Self::bump_stats(stats_tree, "n_image_docs", 1)?,
-                    FileType::Text => {}
-                }
+                    for term in name_term {
+                        let mut freqs: Vec<u64> = match name_term_tree.get(term)? {
+                            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                                ConflictableTransactionError::Abort(DatabaseError::from(e))
+                            })?,
+                            None => Vec::new(),
+                        };
+                        freqs.push(doc_id);
+                        let freqs_bytes = serde_json::to_vec(&freqs).map_err(|e| {
+                            ConflictableTransactionError::Abort(DatabaseError::from(e))
+                        })?;
+                        name_term_tree.insert(term.as_bytes(), freqs_bytes)?;
+                    }
 
-                Ok(())
-            },
-        )?;
+                    match metadata.kind {
+                        FileType::Binary => Self::bump_stats(stats_tree, "n_binary_docs", 1)?,
+                        FileType::Image => Self::bump_stats(stats_tree, "n_image_docs", 1)?,
+                        FileType::Text => {}
+                    }
+
+                    Ok(())
+                },
+            )?;
 
         Ok(doc_id)
     }

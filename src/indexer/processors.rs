@@ -25,31 +25,31 @@ pub fn process_text_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
     }
 
     let tokens = tokenizer(&content);
-    let doc_lenght = tokens.len() as u64;
+    let doc_lenght: u64 = tokens.len().try_into().unwrap_or_default();
     let file_metadata = file.metadata()?;
 
     let metadata = Metadata {
         path: path.to_path_buf(),
         size: file_metadata.size(),
-        modified: file_metadata.mtime() as u64,
+        modified: file_metadata.mtime().cast_unsigned(),
         kind: FileType::Text,
         doc_length: doc_lenght,
     };
 
     let mut counts: HashMap<&str, u64> = HashMap::new();
 
-    tokens.iter().for_each(|tok| {
-        *counts.entry(tok).or_insert(0) += 1;
-    });
+    for tok in &tokens {
+        let count = counts.entry(tok.as_str()).or_insert(0);
+        *count = count.saturating_add(1);
+    }
 
     db.index_document(
-        metadata,
-        &path
-            .file_name()
+        &metadata,
+        path.file_name()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_string(),
-        counts,
+            .as_ref(),
+        &counts,
     )?;
 
     Ok(())

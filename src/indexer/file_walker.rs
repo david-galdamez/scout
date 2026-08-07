@@ -29,9 +29,9 @@ pub enum DirErrors {
 
 pub fn walk_dirs(
     dirs: Vec<PathBuf>,
-    exclude: HashSet<String>,
+    exclude: &HashSet<String>,
     db: &Database,
-) -> Result<Vec<(PathBuf, DirErrors)>, DirErrors> {
+) -> Vec<(PathBuf, DirErrors)> {
     let mut errors = Vec::new();
 
     for dir in dirs {
@@ -53,8 +53,7 @@ pub fn walk_dirs(
                                     errors.push((entry.path().to_path_buf(), e));
                                 }
                             }
-                            Ok(FileType::Binary) => {}
-                            Ok(FileType::Image) => {}
+                            Ok(FileType::Binary | FileType::Image) => {}
                             Err(e) => errors.push((entry.path().to_path_buf(), e)),
                         }
                     }
@@ -65,7 +64,10 @@ pub fn walk_dirs(
                         .map(|p| p.display().to_string())
                         .unwrap_or_default();
 
-                    let loop_path = e.loop_ancestor().unwrap_or(Path::new("")).to_path_buf();
+                    let loop_path = e
+                        .loop_ancestor()
+                        .unwrap_or_else(|| Path::new(""))
+                        .to_path_buf();
 
                     match e.into_io_error() {
                         Some(inner) if inner.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -84,7 +86,7 @@ pub fn walk_dirs(
         }
     }
 
-    Ok(errors)
+    errors
 }
 
 fn validate_dir(dir: &Path) -> Result<(), DirErrors> {

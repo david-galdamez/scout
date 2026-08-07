@@ -18,15 +18,15 @@ fn main() -> Result<()> {
 
     let errors = indexer::walk_dirs(
         config.indexing.include,
-        config
+        &config
             .indexing
             .exclude
             .into_iter()
             .collect::<HashSet<String>>(),
         &db,
-    )?;
+    );
 
-    println!("Errors encountered during directory walk: {:?}", errors);
+    println!("Errors encountered during directory walk: {errors:?}");
 
     Ok(())
 }

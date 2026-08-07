@@ -23,8 +23,9 @@ fn inspect_file(path: &Path) -> Result<FileType, DirErrors> {
     let mut buffer = [0; 8192];
 
     let bytes_read = file.read(&mut buffer)?;
+    let buffer_slice = buffer.get(..bytes_read).unwrap_or_default();
 
-    if inspect(&buffer[..bytes_read]).is_text() {
+    if inspect(buffer_slice).is_text() {
         Ok(FileType::Text)
     } else {
         Ok(FileType::Binary)

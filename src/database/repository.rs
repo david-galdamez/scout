@@ -27,11 +27,11 @@ pub enum DatabaseError {
 impl From<SledError> for DatabaseError {
     fn from(err: SledError) -> Self {
         match err {
-            SledError::Io(e) => DatabaseError::Io(e),
-            SledError::Corruption { .. } => DatabaseError::Corruption,
-            SledError::Unsupported(msg) => DatabaseError::Unsupported(msg),
-            SledError::CollectionNotFound(_) => DatabaseError::CollectionNotFound,
-            SledError::ReportableBug(msg) => DatabaseError::ReportableBug(msg),
+            SledError::Io(e) => Self::Io(e),
+            SledError::Corruption { .. } => Self::Corruption,
+            SledError::Unsupported(msg) => Self::Unsupported(msg),
+            SledError::CollectionNotFound(_) => Self::CollectionNotFound,
+            SledError::ReportableBug(msg) => Self::ReportableBug(msg),
         }
     }
 }
@@ -39,13 +39,23 @@ impl From<SledError> for DatabaseError {
 // `Conflict` is sled's internal retry signal for the *inside* of the closure
 // (`ConflictableTransactionError`) and never escapes `.transaction(...)`. What
 // comes back out is `TransactionError<E>`, which only has `Abort`/`Storage`.
-impl From<TransactionError<DatabaseError>> for DatabaseError {
-    fn from(err: TransactionError<DatabaseError>) -> Self {
+impl From<TransactionError<Self>> for DatabaseError {
+    fn from(err: TransactionError<Self>) -> Self {
         match err {
             TransactionError::Abort(e) => e,
-            TransactionError::Storage(e) => DatabaseError::from(e),
+            TransactionError::Storage(e) => Self::from(e),
         }
     }
+}
+
+// Decodes a big-endian u64 counter stored in `stats`. A length mismatch means the tree
+// holds something other than what we wrote, which we treat as corruption rather than panic.
+fn decode_u64_counter(bytes: &sled::IVec) -> Result<u64, DatabaseError> {
+    let array: [u8; 8] = bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| DatabaseError::Corruption)?;
+    Ok(u64::from_be_bytes(array))
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +75,7 @@ impl Database {
         let terms_tree = db.open_tree("terms")?;
         let stats_tree = db.open_tree("stats")?;
 
-        Ok(Database {
+        Ok(Self {
             db,
             metadata: metadata_tree,
             file_names: file_names_tree,
@@ -78,15 +88,15 @@ impl Database {
     // All writes happen inside a single sled transaction: either everything commits or nothing does.
     pub fn index_document(
         &self,
-        metadata: Metadata,
+        metadata: &Metadata,
         file_name: &str,
-        term_counts: HashMap<&str, u64>,
+        term_counts: &HashMap<&str, u64>,
     ) -> Result<u64, DatabaseError> {
         // generate_id() is its own atomic counter, unrelated to the tree transaction below,
         // and the closure can retry on conflict — so we compute doc_id and serialize the
         // metadata once, outside the closure, instead of burning ids/doing extra work per retry.
         let doc_id = self.db.generate_id()?;
-        let metadata_bytes = serde_json::to_vec(&metadata)?;
+        let metadata_bytes = serde_json::to_vec(metadata)?;
         let doc_length = metadata.doc_length;
 
         (&self.metadata, &self.file_names, &self.terms, &self.stats).transaction(
@@ -103,7 +113,7 @@ impl Database {
                     .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
                 file_names_tree.insert(file_name.as_bytes(), ids_bytes)?;
 
-                for (term, count) in term_counts.iter() {
+                for (term, count) in term_counts {
                     let mut freqs: Vec<TermFrequency> = match terms_tree.get(*term)? {
                         Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
                             ConflictableTransactionError::Abort(DatabaseError::from(e))
@@ -119,24 +129,24 @@ impl Database {
                     terms_tree.insert(term.as_bytes(), freqs_bytes)?;
                 }
 
-                let n_docs = match stats_tree.get("n_docs")? {
-                    Some(bytes) => u64::from_be_bytes(
-                        bytes.as_ref().try_into().expect("n_docs should be 8 bytes"),
-                    ),
-                    None => 0,
-                };
-                stats_tree.insert("n_docs", (n_docs + 1).to_be_bytes().to_vec())?;
+                let n_docs = stats_tree
+                    .get("n_docs")?
+                    .map(|bytes| decode_u64_counter(&bytes))
+                    .transpose()
+                    .map_err(ConflictableTransactionError::Abort)?
+                    .unwrap_or(0);
+                stats_tree.insert("n_docs", n_docs.saturating_add(1).to_be_bytes().to_vec())?;
 
-                let n_terms = match stats_tree.get("n_terms")? {
-                    Some(bytes) => u64::from_be_bytes(
-                        bytes
-                            .as_ref()
-                            .try_into()
-                            .expect("n_terms should be 8 bytes"),
-                    ),
-                    None => 0,
-                };
-                stats_tree.insert("n_terms", (n_terms + doc_length).to_be_bytes().to_vec())?;
+                let n_terms = stats_tree
+                    .get("n_terms")?
+                    .map(|bytes| decode_u64_counter(&bytes))
+                    .transpose()
+                    .map_err(ConflictableTransactionError::Abort)?
+                    .unwrap_or(0);
+                stats_tree.insert(
+                    "n_terms",
+                    n_terms.saturating_add(doc_length).to_be_bytes().to_vec(),
+                )?;
 
                 Ok(())
             },

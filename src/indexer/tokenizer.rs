@@ -25,7 +25,7 @@ pub fn tokenizer(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|token| !token.is_empty() && !STOPWORDS.contains(token))
-        .map(|token| token.to_string())
+        .map(ToString::to_string)
         .collect()
 }
 

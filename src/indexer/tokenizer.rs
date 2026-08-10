@@ -36,6 +36,19 @@ pub fn normalize_file_name(file_name: &str) -> String {
     text.to_lowercase()
 }
 
+// Tokenizes a file name for the name_terms index. Unlike `tokenizer`, this also splits on
+// `_`, since in file names it's almost always a word separator (e.g. "foto_vacaciones.png")
+// rather than part of an identifier (the reason `tokenizer` keeps `_` for source code).
+pub fn tokenize_file_name(file_name: &str) -> Vec<String> {
+    let text = strip_accents(file_name);
+
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty() && !STOPWORDS.contains(token))
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn strip_accents(s: &str) -> String {
     s.nfd()
         .filter(|c| !is_combining_mark(*c))
@@ -102,5 +115,18 @@ mod tests {
     fn stopwords_only_returns_no_tokens() {
         let result: Vec<String> = tokenizer("el la de que y");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn tokenize_file_name_splits_on_underscore() {
+        assert_eq!(
+            tokenize_file_name("foto_vacaciones_2024.png"),
+            vec!["foto", "vacaciones", "2024", "png"]
+        );
+    }
+
+    #[test]
+    fn tokenizer_keeps_underscore_for_code_identifiers() {
+        assert_eq!(tokenizer("archivo_v2.txt"), vec!["archivo_v2", "txt"]);
     }
 }

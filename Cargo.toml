@@ -16,6 +16,9 @@ walkdir = "2.5.0"
 content_inspector = "0.2.4"
 serde_json = "1.0.151"
 
+[dev-dependencies]
+tempfile = "3.14"
+
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }

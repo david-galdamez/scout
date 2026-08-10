@@ -335,3 +335,118 @@ impl Database {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn open_db() -> (TempDir, Database) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db = Database::new(dir.path()).expect("failed to open database");
+        (dir, db)
+    }
+
+    fn sample_metadata(kind: FileType, doc_length: u64) -> Metadata {
+        Metadata {
+            path: PathBuf::from("/tmp/example.txt"),
+            size: 1024,
+            modified: 0,
+            kind,
+            doc_length,
+        }
+    }
+
+    #[test]
+    fn index_document_round_trips_metadata_and_terms() {
+        let (_dir, db) = open_db();
+        let metadata = sample_metadata(FileType::Text, 2);
+        let term_counts = HashMap::from([("hola", 2)]);
+        let name_terms = HashSet::from(["example".to_string()]);
+
+        let doc_id = db
+            .index_document(&metadata, "example.txt", &term_counts, &name_terms)
+            .expect("index_document failed");
+
+        let stored = db.get_metadata(doc_id).expect("get_metadata failed");
+        assert_eq!(stored.map(|m| m.path), Some(metadata.path));
+
+        let freqs = db
+            .get_term_frequencies("hola")
+            .expect("get_term_frequencies failed");
+        assert_eq!(freqs.len(), 1);
+        assert_eq!(freqs[0].doc_id, doc_id);
+        assert_eq!(freqs[0].frequency, 2);
+    }
+
+    #[test]
+    fn get_prefix_files_matches_by_normalized_name_prefix() {
+        let (_dir, db) = open_db();
+        let metadata = sample_metadata(FileType::Text, 1);
+
+        db.index_document(
+            &metadata,
+            "reporte_final.txt",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .expect("index_document failed");
+
+        let files = db
+            .get_prefix_files("reporte")
+            .expect("get_prefix_files failed");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, metadata.path);
+
+        let empty = db
+            .get_prefix_files("otro")
+            .expect("get_prefix_files failed");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn get_name_docs_returns_docs_indexed_under_that_token() {
+        let (_dir, db) = open_db();
+        let metadata = sample_metadata(FileType::Image, 0);
+        let name_terms = HashSet::from(["foto".to_string(), "vacaciones".to_string()]);
+
+        let doc_id = db
+            .index_binary_and_image(&metadata, "foto_vacaciones.png", &name_terms)
+            .expect("index_binary_and_image failed");
+
+        let docs = db.get_name_docs("foto").expect("get_name_docs failed");
+        assert_eq!(docs, vec![doc_id]);
+
+        let none = db
+            .get_name_docs("inexistente")
+            .expect("get_name_docs failed");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn get_stats_reflects_indexed_text_documents() {
+        let (_dir, db) = open_db();
+
+        db.index_document(
+            &sample_metadata(FileType::Text, 4),
+            "a.txt",
+            &HashMap::from([("uno", 1)]),
+            &HashSet::new(),
+        )
+        .expect("index_document failed");
+        db.index_document(
+            &sample_metadata(FileType::Text, 6),
+            "b.txt",
+            &HashMap::from([("dos", 1)]),
+            &HashSet::new(),
+        )
+        .expect("index_document failed");
+
+        let stats = db.get_stats().expect("get_stats failed");
+        assert_eq!(stats.total_text_docs, 2);
+        assert!((stats.avg_total_terms - 5.0).abs() < f64::EPSILON);
+    }
+}

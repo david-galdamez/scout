@@ -10,7 +10,7 @@ use crate::{
     database::{Database, FileType, Metadata},
     indexer::{
         file_walker::DirErrors,
-        tokenizer::{normalize_file_name, tokenizer},
+        tokenizer::{normalize_file_name, tokenize_file_name, tokenizer},
     },
 };
 
@@ -52,7 +52,7 @@ pub fn process_text_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
             .to_string_lossy()
             .as_ref(),
     );
-    let file_name_tokens = tokenizer(&file_name);
+    let file_name_tokens = tokenize_file_name(&file_name);
 
     db.index_document(
         &metadata,
@@ -86,7 +86,7 @@ pub fn process_binary_and_image_file(
             .to_string_lossy()
             .as_ref(),
     );
-    let file_name_tokens = tokenizer(&file_name);
+    let file_name_tokens = tokenize_file_name(&file_name);
 
     db.index_binary_and_image(
         &metadata,

@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     database::{Database, DatabaseError, Metadata, Stats, TermFrequency},
-    indexer::{normalize_file_name, tokenizer},
+    indexer::{normalize_file_name, tokenize_file_name, tokenizer},
     util::u64_to_f64_lossy,
 };
 
@@ -46,6 +46,7 @@ impl<'a> Searcher<'a> {
     fn search_files(&self, query: &str) -> Result<Vec<Metadata>, SearchError> {
         let stats = self.db.get_stats()?;
         let tokens = tokenizer(query);
+        let name_tokens = tokenize_file_name(query);
         let mut score: HashMap<u64, f64> = HashMap::new();
         let mut metadata: HashMap<u64, Metadata> = HashMap::new();
         let mut name_files: HashSet<u64> = HashSet::new();
@@ -67,7 +68,9 @@ impl<'a> Searcher<'a> {
                     &mut score,
                 );
             }
+        }
 
+        for tok in &name_tokens {
             let name_docs = self.db.get_name_docs(tok)?;
             for doc in &name_docs {
                 if !score.contains_key(doc)
@@ -126,5 +129,134 @@ impl<'a> Searcher<'a> {
                 .and_modify(|s| s.add_assign(bm25_score))
                 .or_insert(bm25_score);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::database::FileType;
+
+    use super::*;
+
+    fn open_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db = Database::new(dir.path()).expect("failed to open database");
+        (dir, db)
+    }
+
+    fn metadata(kind: FileType, path: &str, doc_length: u64) -> Metadata {
+        Metadata {
+            path: PathBuf::from(path),
+            size: 0,
+            modified: 0,
+            kind,
+            doc_length,
+        }
+    }
+
+    #[test]
+    fn search_returns_exact_title_prefix_match_without_ranking() {
+        let (_dir, db) = open_db();
+        db.index_document(
+            &metadata(FileType::Text, "/docs/reporte_final.txt", 2),
+            "reporte_final.txt",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .expect("index_document failed");
+
+        let results = Searcher::new(&db).search("reporte").expect("search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, PathBuf::from("/docs/reporte_final.txt"));
+    }
+
+    #[test]
+    fn search_ranks_documents_by_bm25_when_no_prefix_matches() {
+        let (_dir, db) = open_db();
+        let tokens_a = tokenizer("manzana pera manzana");
+        let counts_a: HashMap<&str, u64> = tokens_a.iter().fold(HashMap::new(), |mut acc, tok| {
+            *acc.entry(tok.as_str()).or_insert(0) += 1;
+            acc
+        });
+        db.index_document(
+            &metadata(
+                FileType::Text,
+                "/docs/frutas.txt",
+                tokens_a.len().try_into().expect("doc length overflow"),
+            ),
+            "frutas.txt",
+            &counts_a,
+            &HashSet::new(),
+        )
+        .expect("index_document failed");
+
+        let tokens_b = tokenizer("kiwi platano");
+        let counts_b: HashMap<&str, u64> = tokens_b.iter().fold(HashMap::new(), |mut acc, tok| {
+            *acc.entry(tok.as_str()).or_insert(0) += 1;
+            acc
+        });
+        db.index_document(
+            &metadata(
+                FileType::Text,
+                "/docs/otras.txt",
+                tokens_b.len().try_into().expect("doc length overflow"),
+            ),
+            "otras.txt",
+            &counts_b,
+            &HashSet::new(),
+        )
+        .expect("index_document failed");
+
+        let results = Searcher::new(&db).search("kiwi").expect("search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, PathBuf::from("/docs/otras.txt"));
+    }
+
+    #[test]
+    fn search_falls_back_to_name_terms_for_non_text_files() {
+        let (_dir, db) = open_db();
+        // `tokenize_file_name` (unlike `tokenizer`) splits on `_`, so "vacaciones"
+        // ends up indexed as its own name term even in a snake_case file name.
+        let file_name = normalize_file_name("2024_vacaciones.png");
+        let name_terms: HashSet<String> = tokenize_file_name(&file_name).into_iter().collect();
+
+        db.index_binary_and_image(
+            &metadata(FileType::Image, "/photos/2024_vacaciones.png", 0),
+            &file_name,
+            &name_terms,
+        )
+        .expect("index_binary_and_image failed");
+
+        let results = Searcher::new(&db)
+            .search("vacaciones")
+            .expect("search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].path,
+            PathBuf::from("/photos/2024_vacaciones.png")
+        );
+    }
+
+    #[test]
+    fn search_returns_empty_when_nothing_matches() {
+        let (_dir, db) = open_db();
+        db.index_document(
+            &metadata(FileType::Text, "/docs/a.txt", 1),
+            "a.txt",
+            &HashMap::from([("hola", 1)]),
+            &HashSet::new(),
+        )
+        .expect("index_document failed");
+
+        let results = Searcher::new(&db)
+            .search("inexistente")
+            .expect("search failed");
+
+        assert!(results.is_empty());
     }
 }

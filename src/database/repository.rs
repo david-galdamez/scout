@@ -77,6 +77,7 @@ pub struct Database {
     terms: Tree,
     name_terms: Tree,
     stats: Tree,
+    paths: Tree,
 }
 
 impl Database {
@@ -87,6 +88,7 @@ impl Database {
         let terms_tree = db.open_tree("terms")?;
         let name_terms_tree = db.open_tree("name_terms")?;
         let stats_tree = db.open_tree("stats")?;
+        let paths_tree = db.open_tree("paths")?;
 
         Ok(Self {
             db,
@@ -95,6 +97,7 @@ impl Database {
             terms: terms_tree,
             name_terms: name_terms_tree,
             stats: stats_tree,
+            paths: paths_tree,
         })
     }
 
@@ -120,10 +123,23 @@ impl Database {
             &self.terms,
             &self.name_terms,
             &self.stats,
+            &self.paths,
         )
             .transaction(
-                |(metadata_tree, file_names_tree, terms_tree, name_term_tree, stats_tree)| {
+                |(
+                    metadata_tree,
+                    file_names_tree,
+                    terms_tree,
+                    name_term_tree,
+                    stats_tree,
+                    paths_tree,
+                )| {
                     metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
+
+                    paths_tree.insert(
+                        metadata.path.to_string_lossy().as_bytes(),
+                        &doc_id.to_be_bytes(),
+                    )?;
 
                     let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
                         Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
@@ -196,10 +212,16 @@ impl Database {
             &self.file_names,
             &self.name_terms,
             &self.stats,
+            &self.paths,
         )
             .transaction(
-                |(metadata_tree, file_names_tree, name_term_tree, stats_tree)| {
+                |(metadata_tree, file_names_tree, name_term_tree, stats_tree, paths_tree)| {
                     metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
+
+                    paths_tree.insert(
+                        metadata.path.to_string_lossy().as_bytes(),
+                        &doc_id.to_be_bytes(),
+                    )?;
 
                     let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
                         Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
@@ -238,6 +260,22 @@ impl Database {
             )?;
 
         Ok(doc_id)
+    }
+
+    pub fn get_file_modified_time(&self, path: &Path) -> Result<Option<u64>, DatabaseError> {
+        match self.paths.get(path.to_string_lossy().as_bytes())? {
+            Some(bytes) => {
+                let doc_id: u64 = decode_u64_counter(&bytes)?;
+                match self.metadata.get(doc_id.to_be_bytes())? {
+                    Some(metadata_bytes) => {
+                        let metadata: Metadata = serde_json::from_slice(&metadata_bytes)?;
+                        Ok(Some(metadata.modified))
+                    }
+                    None => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     // Bumps a counter in the stats tree by a given amount. If the key doesn't exist, it initializes it to 0 before adding.

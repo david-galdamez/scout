@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -28,6 +29,16 @@ pub enum DirErrors {
     SymlinkLoop,
     #[error("Database error: {0}")]
     DatabaseError(#[from] crate::database::DatabaseError),
+    #[error("File modified since it was indexed; reindexing isn't implemented yet")]
+    PendingReindex,
+}
+
+// Whether a file is being seen for the first time, is unchanged since the last time it was
+// indexed, or was modified since then.
+enum IndexState {
+    New,
+    Unchanged,
+    Modified,
 }
 
 // Walks through the provided directories, classifies files, and processes them accordingly. Returns a vector of errors encountered during the walk.
@@ -51,18 +62,16 @@ pub fn walk_dirs(
             match entry {
                 Ok(entry) => {
                     if entry.file_type().is_file() {
-                        match classify(entry.path()) {
-                            Ok(FileType::Text) => {
-                                if let Err(e) = process_text_file(entry.path(), db) {
+                        match index_state(entry.path(), db) {
+                            Ok(IndexState::Unchanged) => {}
+                            Ok(IndexState::New) => {
+                                if let Err(e) = index_file(entry.path(), db) {
                                     errors.push((entry.path().to_path_buf(), e));
                                 }
                             }
-                            Ok(file_type @ (FileType::Binary | FileType::Image)) => {
-                                if let Err(e) =
-                                    process_binary_and_image_file(entry.path(), db, file_type)
-                                {
-                                    errors.push((entry.path().to_path_buf(), e));
-                                }
+                            Ok(IndexState::Modified) => {
+                                errors
+                                    .push((entry.path().to_path_buf(), DirErrors::PendingReindex));
                             }
                             Err(e) => errors.push((entry.path().to_path_buf(), e)),
                         }
@@ -110,4 +119,29 @@ fn validate_dir(dir: &Path) -> Result<(), DirErrors> {
     }
 
     Ok(())
+}
+
+// Classifies a file and dispatches it to the right processor. Only called for files that
+// `index_state` reports as `New` — `Modified` files are collected as `DirErrors::PendingReindex`
+// instead, since reusing this would mint a second doc_id for the same path.
+fn index_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
+    match classify(path)? {
+        FileType::Text => process_text_file(path, db),
+        file_type @ (FileType::Binary | FileType::Image) => {
+            process_binary_and_image_file(path, db, file_type)
+        }
+    }
+}
+
+// Compares the file's current mtime against the mtime recorded in `Metadata` the last time
+// it was indexed (looked up via the `paths` tree) to tell new, unchanged, and modified files
+// apart.
+fn index_state(path: &Path, db: &Database) -> Result<IndexState, DirErrors> {
+    let current_modified = std::fs::metadata(path)?.mtime().cast_unsigned();
+
+    Ok(match db.get_file_modified_time(path)? {
+        None => IndexState::New,
+        Some(recorded_modified) if current_modified > recorded_modified => IndexState::Modified,
+        Some(_) => IndexState::Unchanged,
+    })
 }

@@ -1,4 +1,7 @@
-use std::{collections::HashMap, ops::AddAssign};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::AddAssign,
+};
 
 use thiserror::Error;
 
@@ -19,7 +22,6 @@ pub enum SearchError {
 
 // TODO: Implement the search function that takes a query string and searches for it in the indexed files. The function should return a Result type with either a list of possible files or a SearchError if the search fails.
 // TODO: Implement the bm25 calculator for every indexed file and return the list of possible files ordered in descending order of their bm25 score.
-
 pub struct Searcher<'a> {
     db: &'a Database,
 }
@@ -46,6 +48,7 @@ impl<'a> Searcher<'a> {
         let tokens = tokenizer(query);
         let mut score: HashMap<u64, f64> = HashMap::new();
         let mut metadata: HashMap<u64, Metadata> = HashMap::new();
+        let mut name_files: HashSet<u64> = HashSet::new();
         let mut files = Vec::new();
 
         for tok in &tokens {
@@ -64,6 +67,16 @@ impl<'a> Searcher<'a> {
                     &mut score,
                 );
             }
+
+            let name_docs = self.db.get_name_docs(tok)?;
+            for doc in &name_docs {
+                if !score.contains_key(doc)
+                    && let Some(meta) = self.db.get_metadata(*doc)?
+                {
+                    metadata.insert(*doc, meta);
+                    name_files.insert(*doc);
+                }
+            }
         }
 
         let mut scored_docs: Vec<(u64, f64)> = score.into_iter().collect();
@@ -71,6 +84,12 @@ impl<'a> Searcher<'a> {
 
         for (doc_id, _) in &scored_docs {
             if let Some(metadata) = metadata.get(doc_id) {
+                files.push(metadata.clone());
+            }
+        }
+
+        for doc_id in name_files {
+            if let Some(metadata) = metadata.get(&doc_id) {
                 files.push(metadata.clone());
             }
         }

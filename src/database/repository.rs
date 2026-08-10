@@ -324,4 +324,14 @@ impl Database {
             None => Ok(Vec::new()),
         }
     }
+
+    pub fn get_name_docs(&self, term: &str) -> Result<Vec<u64>, DatabaseError> {
+        match self.name_terms.get(term)? {
+            Some(bytes) => {
+                let doc_ids: Vec<u64> = serde_json::from_slice(&bytes)?;
+                Ok(doc_ids)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
 }

@@ -32,12 +32,14 @@ pub struct Indexing {
 }
 
 impl Config {
+    // Returns the default path for the configuration file, which is located in the user's home directory as ".scout.toml".
     pub fn default_path() -> Result<PathBuf, ConfigError> {
         let home_path = dirs::home_dir().ok_or(ConfigError::HomeDirNotFound)?;
         let config_dir = home_path.join(".scout.toml");
         Ok(config_dir)
     }
 
+    // Returns the default path for the database, which is located in the user's data directory under "scout/index".
     pub fn default_db_path() -> Result<PathBuf, ConfigError> {
         let db_path = dirs::data_dir().ok_or(ConfigError::HomeDirNotFound)?;
         Ok(db_path.join("scout").join("index"))
@@ -54,12 +56,14 @@ pub fn load_and_validate_config() -> Result<Config, ConfigError> {
     Ok(config)
 }
 
+// Loads the configuration from the specified path and returns a Config struct.
 fn load_config(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
     let config_str = fs::read_to_string(path)?;
     let config: Config = toml::from_str(config_str.as_str())?;
     Ok(config)
 }
 
+// Creates the configuration file with default settings if it doesn't exist. The default configuration includes the user's "Documents" directory in the include list and a set of common directories to exclude.
 fn create_file_if_missing(path: impl AsRef<Path>) -> Result<(), ConfigError> {
     if !path.as_ref().exists() {
         let home_path = dirs::home_dir().ok_or(ConfigError::HomeDirNotFound)?;

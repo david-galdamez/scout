@@ -5,3 +5,5 @@ mod processors;
 mod tokenizer;
 
 pub use file_walker::walk_dirs;
+pub use tokenizer::normalize_file_name;
+pub use tokenizer::tokenizer;

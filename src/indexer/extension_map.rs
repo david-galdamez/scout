@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 
 use crate::database::FileType;
 
+// A static mapping of file extensions to their corresponding FileType.
 pub static EXTENSION_MAP: LazyLock<HashMap<&'static str, FileType>> = LazyLock::new(|| {
     HashMap::from([
         // Text: plain text, docs, config, source code

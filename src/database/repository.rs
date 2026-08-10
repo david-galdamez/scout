@@ -11,9 +11,12 @@ use sled::{
 };
 use thiserror::Error;
 
-use crate::database::{
-    FileType,
-    schemas::{Metadata, TermFrequency},
+use crate::{
+    database::{
+        FileType, Stats,
+        schemas::{Metadata, TermFrequency},
+    },
+    util::u64_to_f64_lossy,
 };
 
 #[derive(Debug, Error)]
@@ -251,5 +254,74 @@ impl Database {
             .unwrap_or(0);
         stats_tree.insert(key, n_docs.saturating_add(counter).to_be_bytes().to_vec())?;
         Ok(())
+    }
+
+    // Retrieves the metadata for a given document ID. Returns None if the document ID does not exist.
+    pub fn get_metadata(&self, doc_id: u64) -> Result<Option<Metadata>, DatabaseError> {
+        match self.metadata.get(doc_id.to_be_bytes())? {
+            Some(bytes) => {
+                let metadata: Metadata = serde_json::from_slice(&bytes)?;
+                Ok(Some(metadata))
+            }
+            None => Ok(None),
+        }
+    }
+
+    // Retrieves the statistics of the indexed files, including total text documents, total terms, and average total terms. Returns a Stats struct containing the statistics.
+    pub fn get_stats(&self) -> Result<Stats, DatabaseError> {
+        let total_text_docs = self
+            .stats
+            .get("n_text_docs")?
+            .map(|bytes| decode_u64_counter(&bytes))
+            .transpose()?
+            .unwrap_or(0);
+
+        let total_terms = self
+            .stats
+            .get("n_terms")?
+            .map(|bytes| decode_u64_counter(&bytes))
+            .transpose()?
+            .unwrap_or(0);
+
+        let avg_total_terms = if total_text_docs > 0 {
+            u64_to_f64_lossy(total_terms) / u64_to_f64_lossy(total_text_docs)
+        } else {
+            0.0
+        };
+
+        Ok(Stats {
+            total_text_docs,
+            // total_terms,
+            avg_total_terms,
+        })
+    }
+
+    // Retrieves all files whose names start with the given query string. Returns a vector of Metadata for the matching files.
+    pub fn get_prefix_files(&self, query: &str) -> Result<Vec<Metadata>, DatabaseError> {
+        let mut files = Vec::new();
+        let file_names = self.file_names.scan_prefix(query);
+
+        for item in file_names {
+            let (_, value) = item?;
+            let doc_ids: Vec<u64> = serde_json::from_slice(&value)?;
+            for id in &doc_ids {
+                if let Some(metadata) = self.get_metadata(*id)? {
+                    files.push(metadata);
+                }
+            }
+        }
+
+        Ok(files)
+    }
+
+    // Retrieves the term frequencies for a given term. Returns a vector of TermFrequency structs, each containing a document ID and the frequency of the term in that document.
+    pub fn get_term_frequencies(&self, term: &str) -> Result<Vec<TermFrequency>, DatabaseError> {
+        match self.terms.get(term)? {
+            Some(bytes) => {
+                let term_frequencies: Vec<TermFrequency> = serde_json::from_slice(&bytes)?;
+                Ok(term_frequencies)
+            }
+            None => Ok(Vec::new()),
+        }
     }
 }

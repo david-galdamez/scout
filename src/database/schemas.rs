@@ -12,7 +12,7 @@ pub enum FileType {
 
 // Represents the structure of the database used for storing file metadata.
 // KEY: document ID (u64) in the sled database
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Metadata {
     pub path: PathBuf,
     pub size: u64,
@@ -29,4 +29,12 @@ pub struct Metadata {
 pub struct TermFrequency {
     pub doc_id: u64,
     pub frequency: u64,
+}
+
+// Represents the structure of the database used for storing statistics about the indexed files.
+#[derive(Debug)]
+pub struct Stats {
+    pub total_text_docs: u64,
+    // pub total_terms: u64,
+    pub avg_total_terms: f64,
 }

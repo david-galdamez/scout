@@ -33,6 +33,15 @@ impl FileId {
         bytes[8..].copy_from_slice(&self.file_index.to_be_bytes());
         bytes
     }
+
+    // Reconstructs a `FileId` from bytes written by `to_bytes` — e.g. a raw key read back out
+    // of the `file_ids` tree. Returns `None` if `bytes` isn't exactly 16 bytes, which would
+    // mean the tree holds something other than what we wrote.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let device = u64::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
+        let file_index = u64::from_be_bytes(bytes.get(8..16)?.try_into().ok()?);
+        Some(Self { device, file_index })
+    }
 }
 
 // Returns `None` when the platform/filesystem can't provide a stable identifier (rare, but

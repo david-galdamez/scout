@@ -4,7 +4,7 @@ use std::{
 };
 
 use sled::{
-    Db, Error as SledError, Tree, open,
+    Db, Error as SledError, IVec, Tree, open,
     transaction::{
         ConflictableTransactionError, TransactionError, Transactional, TransactionalTree,
     },
@@ -591,6 +591,87 @@ impl Database {
         Ok(doc_id)
     }
 
+    pub fn delete_document(&self, file_id: FileId, file_name: &str) -> Result<(), DatabaseError> {
+        let doc_id = match self.file_ids.get(file_id.to_bytes())? {
+            Some(bytes) => decode_u64_counter(&bytes)?,
+            None => return Err(DatabaseError::CollectionNotFound),
+        };
+
+        let metadata: Metadata = match self.metadata.get(doc_id.to_be_bytes())? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
+            None => return Err(DatabaseError::CollectionNotFound),
+        };
+
+        let name_terms: Vec<String> = match self.document_name_terms.get(doc_id.to_be_bytes())? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
+            None => Vec::new(),
+        };
+        let doc_terms: Vec<String> = match self.document_terms.get(doc_id.to_be_bytes())? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
+            None => Vec::new(),
+        };
+
+        let path = metadata.path.to_string_lossy().into_owned();
+        (
+            &self.metadata,
+            &self.file_names,
+            &self.terms,
+            &self.name_terms,
+            &self.stats,
+            &self.paths,
+            &self.document_terms,
+            &self.document_name_terms,
+            &self.file_ids,
+        )
+            .transaction(
+                |(
+                    metadata_tree,
+                    file_names_tree,
+                    terms_tree,
+                    name_term_tree,
+                    stats_tree,
+                    paths_tree,
+                    document_terms_tree,
+                    document_name_tree,
+                    file_id_tree,
+                )| {
+                    Self::remove_stale_postings(
+                        terms_tree,
+                        name_term_tree,
+                        file_names_tree,
+                        &doc_terms,
+                        &name_terms,
+                        file_name,
+                        doc_id,
+                    )?;
+
+                    match metadata.kind {
+                        FileType::Text => {
+                            Self::decrease_stat(stats_tree, "n_text_docs", 1)?;
+                            Self::decrease_stat(stats_tree, "n_terms", metadata.doc_length)?;
+                        }
+                        FileType::Binary => Self::decrease_stat(stats_tree, "n_binary_docs", 1)?,
+                        FileType::Image => Self::decrease_stat(stats_tree, "n_image_docs", 1)?,
+                    }
+                    metadata_tree.remove(&doc_id.to_be_bytes())?;
+                    document_name_tree.remove(&doc_id.to_be_bytes())?;
+                    document_terms_tree.remove(&doc_id.to_be_bytes())?;
+                    paths_tree.remove(path.as_bytes())?;
+                    file_id_tree.remove(&file_id.to_bytes())?;
+
+                    Ok(())
+                },
+            )?;
+
+        Ok(())
+    }
+
+    pub fn get_all_file_ids(&self) -> Result<Vec<IVec>, DatabaseError> {
+        let file_ids = self.file_ids.iter().keys().collect::<Result<_, _>>()?;
+
+        Ok(file_ids)
+    }
+
     pub fn get_file_modified_time(&self, path: &Path) -> Result<Option<u64>, DatabaseError> {
         match self.paths.get(path.to_string_lossy().as_bytes())? {
             Some(bytes) => {
@@ -744,6 +825,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::util::file_id;
 
     fn open_db() -> (TempDir, Database) {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -759,6 +841,17 @@ mod tests {
             kind,
             doc_length,
         }
+    }
+
+    // Writes a real file to disk and returns its path plus platform `FileId` — `delete_document`
+    // is keyed on `FileId`, which (unlike the rest of `Metadata`) can't be faked with a
+    // made-up value since it must round-trip through `util::file_id`'s real OS metadata call.
+    fn real_file(dir: &TempDir, name: &str) -> (PathBuf, FileId) {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"content").expect("failed to write test file");
+        let fs_metadata = std::fs::metadata(&path).expect("failed to read test file metadata");
+        let id = file_id(&fs_metadata).expect("file_id should be available in tests");
+        (path, id)
     }
 
     #[test]
@@ -1070,5 +1163,149 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn delete_document_removes_text_doc_from_every_tree() {
+        let (dir, db) = open_db();
+        let (path, id) = real_file(&dir, "example.txt");
+        let metadata = Metadata {
+            path: path.clone(),
+            size: 7,
+            modified: 0,
+            kind: FileType::Text,
+            doc_length: 1,
+        };
+
+        let doc_id = db
+            .index_document(
+                &metadata,
+                "example.txt",
+                &HashMap::from([("hola", 1)]),
+                &HashSet::from(["example".to_string()]),
+                Some(id),
+            )
+            .expect("index_document failed");
+
+        db.delete_document(id, "example.txt")
+            .expect("delete_document failed");
+
+        assert!(
+            db.get_metadata(doc_id)
+                .expect("get_metadata failed")
+                .is_none()
+        );
+        assert!(
+            db.get_term_frequencies("hola")
+                .expect("get_term_frequencies failed")
+                .is_empty()
+        );
+        assert!(
+            db.get_name_docs("example")
+                .expect("get_name_docs failed")
+                .is_empty()
+        );
+        assert!(
+            db.get_prefix_files("example")
+                .expect("get_prefix_files failed")
+                .is_empty()
+        );
+        assert!(
+            db.get_doc_id_by_file_id(id)
+                .expect("get_doc_id_by_file_id failed")
+                .is_none()
+        );
+        assert!(
+            db.get_doc_id_by_path(&path)
+                .expect("get_doc_id_by_path failed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn delete_document_decrements_text_doc_stats() {
+        let (dir, db) = open_db();
+        let (path_a, id_a) = real_file(&dir, "a.txt");
+        let (path_b, id_b) = real_file(&dir, "b.txt");
+
+        db.index_document(
+            &Metadata {
+                path: path_a,
+                size: 1,
+                modified: 0,
+                kind: FileType::Text,
+                doc_length: 4,
+            },
+            "a.txt",
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(id_a),
+        )
+        .expect("index_document failed");
+        db.index_document(
+            &Metadata {
+                path: path_b,
+                size: 1,
+                modified: 0,
+                kind: FileType::Text,
+                doc_length: 6,
+            },
+            "b.txt",
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(id_b),
+        )
+        .expect("index_document failed");
+
+        db.delete_document(id_a, "a.txt")
+            .expect("delete_document failed");
+
+        let stats = db.get_stats().expect("get_stats failed");
+        assert_eq!(stats.total_text_docs, 1);
+        assert!((stats.avg_total_terms - 6.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn delete_document_decrements_image_doc_count_not_terms() {
+        let (dir, db) = open_db();
+        let (path, id) = real_file(&dir, "foto.png");
+        let metadata = Metadata {
+            path,
+            size: 1,
+            modified: 0,
+            kind: FileType::Image,
+            doc_length: 0,
+        };
+
+        db.index_binary_and_image(
+            &metadata,
+            "foto.png",
+            &HashSet::from(["foto".to_string()]),
+            Some(id),
+        )
+        .expect("index_binary_and_image failed");
+
+        db.delete_document(id, "foto.png")
+            .expect("delete_document failed");
+
+        assert!(
+            db.get_name_docs("foto")
+                .expect("get_name_docs failed")
+                .is_empty()
+        );
+        // Deleting an image doc must not touch n_terms — it never contributed to it.
+        let stats = db.get_stats().expect("get_stats failed");
+        assert_eq!(stats.total_text_docs, 0);
+        assert!((stats.avg_total_terms - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn delete_document_errors_for_unknown_file_id() {
+        let (dir, db) = open_db();
+        let (_path, id) = real_file(&dir, "never_indexed.txt");
+
+        let result = db.delete_document(id, "never_indexed.txt");
+
+        assert!(matches!(result, Err(DatabaseError::CollectionNotFound)));
     }
 }

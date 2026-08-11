@@ -16,7 +16,7 @@ use crate::{
         FileType, Stats,
         schemas::{Metadata, TermFrequency},
     },
-    util::u64_to_f64_lossy,
+    util::{FileId, u64_to_f64_lossy},
 };
 
 #[derive(Debug, Error)]
@@ -80,6 +80,7 @@ pub struct Database {
     paths: Tree,
     document_terms: Tree,
     document_name_terms: Tree,
+    file_ids: Tree,
 }
 
 impl Database {
@@ -93,6 +94,7 @@ impl Database {
         let paths_tree = db.open_tree("paths")?;
         let document_terms_tree = db.open_tree("document_terms")?;
         let document_name_terms_tree = db.open_tree("document_name_terms")?;
+        let file_ids_tree = db.open_tree("file_ids")?;
 
         Ok(Self {
             db,
@@ -104,6 +106,7 @@ impl Database {
             paths: paths_tree,
             document_terms: document_terms_tree,
             document_name_terms: document_name_terms_tree,
+            file_ids: file_ids_tree,
         })
     }
 
@@ -115,6 +118,7 @@ impl Database {
         file_name: &str,
         term_counts: &HashMap<&str, u64>,
         name_term: &HashSet<String>,
+        file_id: Option<FileId>,
     ) -> Result<u64, DatabaseError> {
         // generate_id() is its own atomic counter, unrelated to the tree transaction below,
         // and the closure can retry on conflict — so we compute doc_id and serialize the
@@ -132,6 +136,7 @@ impl Database {
             &self.paths,
             &self.document_terms,
             &self.document_name_terms,
+            &self.file_ids,
         )
             .transaction(
                 |(
@@ -143,6 +148,7 @@ impl Database {
                     paths_tree,
                     document_terms_tree,
                     document_name_tree,
+                    file_ids_tree,
                 )| {
                     metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
 
@@ -150,6 +156,10 @@ impl Database {
                         metadata.path.to_string_lossy().as_bytes(),
                         &doc_id.to_be_bytes(),
                     )?;
+
+                    if let Some(id) = file_id {
+                        file_ids_tree.insert(&id.to_bytes(), &doc_id.to_be_bytes())?;
+                    }
 
                     let name_terms: Vec<String> = name_term.iter().cloned().collect();
                     let name_terms_bytes = serde_json::to_vec(&name_terms)
@@ -189,6 +199,7 @@ impl Database {
         metadata: &Metadata,
         file_name: &str,
         name_term: &HashSet<String>,
+        file_id: Option<FileId>,
     ) -> Result<u64, DatabaseError> {
         // generate_id() is its own atomic counter, unrelated to the tree transaction below,
         // and the closure can retry on conflict — so we compute doc_id and serialize the
@@ -203,6 +214,7 @@ impl Database {
             &self.stats,
             &self.paths,
             &self.document_name_terms,
+            &self.file_ids,
         )
             .transaction(
                 |(
@@ -212,6 +224,7 @@ impl Database {
                     stats_tree,
                     paths_tree,
                     document_name_tree,
+                    file_ids_tree,
                 )| {
                     metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
 
@@ -219,6 +232,10 @@ impl Database {
                         metadata.path.to_string_lossy().as_bytes(),
                         &doc_id.to_be_bytes(),
                     )?;
+
+                    if let Some(id) = file_id {
+                        file_ids_tree.insert(&id.to_bytes(), &doc_id.to_be_bytes())?;
+                    }
 
                     let name_terms: Vec<String> = name_term.iter().cloned().collect();
                     let name_terms_bytes = serde_json::to_vec(&name_terms)
@@ -396,18 +413,23 @@ impl Database {
         Ok(())
     }
 
-    // Reindexes a text document by updating its metadata, file name, and term frequencies in the database.
+    // Reindexes a text document by updating its metadata, file name, and term frequencies in
+    // the database. `doc_id` must already be resolved by the caller (via the file's platform
+    // identifier, which — unlike a path — survives a rename) rather than looked up by path
+    // here, so a rename is handled the same way as a content-only change: the doc's old
+    // `Metadata` (read internally, below) may have a different `path` than `metadata.path`,
+    // in which case the stale `paths` entry is removed and the new one inserted.
     pub fn reindex_text_document(
         &self,
+        doc_id: u64,
         metadata: &Metadata,
         old_file_name: &str,
-        old_doc_lenght: u64,
         file_name: &str,
         term_counts: &HashMap<&str, u64>,
         name_term: &HashSet<String>,
     ) -> Result<u64, DatabaseError> {
-        let doc_id = match self.paths.get(metadata.path.to_string_lossy().as_bytes())? {
-            Some(bytes) => decode_u64_counter(&bytes)?,
+        let old_metadata: Metadata = match self.metadata.get(doc_id.to_be_bytes())? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
             None => return Err(DatabaseError::CollectionNotFound),
         };
 
@@ -422,12 +444,15 @@ impl Database {
         };
 
         let metadata_bytes = serde_json::to_vec(metadata)?;
+        let old_path = old_metadata.path.to_string_lossy().into_owned();
+        let new_path = metadata.path.to_string_lossy().into_owned();
         (
             &self.metadata,
             &self.file_names,
             &self.terms,
             &self.name_terms,
             &self.stats,
+            &self.paths,
             &self.document_terms,
             &self.document_name_terms,
         )
@@ -438,6 +463,7 @@ impl Database {
                     terms_tree,
                     name_term_tree,
                     stats_tree,
+                    paths_tree,
                     document_terms_tree,
                     document_name_tree,
                 )| {
@@ -450,7 +476,12 @@ impl Database {
                         old_file_name,
                         doc_id,
                     )?;
-                    Self::decrease_stat(stats_tree, "n_terms", old_doc_lenght)?;
+                    Self::decrease_stat(stats_tree, "n_terms", old_metadata.doc_length)?;
+
+                    if old_path != new_path {
+                        paths_tree.remove(old_path.as_bytes())?;
+                    }
+                    paths_tree.insert(new_path.as_bytes(), &doc_id.to_be_bytes())?;
 
                     metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
 
@@ -485,17 +516,19 @@ impl Database {
     }
 
     // Reindexes a binary/image document by updating its metadata and name terms in the
-    // database. Same shape as `reindex_text_document`, minus everything that only applies to
-    // text content (the `terms` tree, `document_terms`, and the `n_terms` stat delta).
+    // database. Same shape (and same rename handling) as `reindex_text_document`, minus
+    // everything that only applies to text content (the `terms` tree, `document_terms`, and
+    // the `n_terms` stat delta).
     pub fn reindex_binary_and_image(
         &self,
+        doc_id: u64,
         metadata: &Metadata,
         old_file_name: &str,
         file_name: &str,
         name_term: &HashSet<String>,
     ) -> Result<u64, DatabaseError> {
-        let doc_id = match self.paths.get(metadata.path.to_string_lossy().as_bytes())? {
-            Some(bytes) => decode_u64_counter(&bytes)?,
+        let old_metadata: Metadata = match self.metadata.get(doc_id.to_be_bytes())? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
             None => return Err(DatabaseError::CollectionNotFound),
         };
 
@@ -506,14 +539,23 @@ impl Database {
             };
 
         let metadata_bytes = serde_json::to_vec(metadata)?;
+        let old_path = old_metadata.path.to_string_lossy().into_owned();
+        let new_path = metadata.path.to_string_lossy().into_owned();
         (
             &self.metadata,
             &self.file_names,
             &self.name_terms,
             &self.document_name_terms,
+            &self.paths,
         )
             .transaction(
-                |(metadata_tree, file_names_tree, name_term_tree, document_name_tree)| {
+                |(
+                    metadata_tree,
+                    file_names_tree,
+                    name_term_tree,
+                    document_name_tree,
+                    paths_tree,
+                )| {
                     Self::remove_name_postings(
                         name_term_tree,
                         file_names_tree,
@@ -521,6 +563,11 @@ impl Database {
                         old_file_name,
                         doc_id,
                     )?;
+
+                    if old_path != new_path {
+                        paths_tree.remove(old_path.as_bytes())?;
+                    }
+                    paths_tree.insert(new_path.as_bytes(), &doc_id.to_be_bytes())?;
 
                     metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
 
@@ -560,6 +607,24 @@ impl Database {
         }
     }
 
+    // Resolves a doc_id by the file's platform identifier (stable across renames). Returns
+    // `None` if no doc was ever indexed under that identifier.
+    pub fn get_doc_id_by_file_id(&self, file_id: FileId) -> Result<Option<u64>, DatabaseError> {
+        match self.file_ids.get(file_id.to_bytes())? {
+            Some(bytes) => Ok(Some(decode_u64_counter(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    // Resolves a doc_id by its current path. Used as a fallback when the platform can't
+    // provide a stable file identifier (see `get_doc_id_by_file_id`).
+    pub fn get_doc_id_by_path(&self, path: &Path) -> Result<Option<u64>, DatabaseError> {
+        match self.paths.get(path.to_string_lossy().as_bytes())? {
+            Some(bytes) => Ok(Some(decode_u64_counter(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
     // Bumps a counter in the stats tree by a given amount. If the key doesn't exist, it initializes it to 0 before adding.
     fn bump_stats(
         stats_tree: &TransactionalTree,
@@ -594,22 +659,6 @@ impl Database {
 
     // Retrieves the metadata for a given document ID. Returns None if the document ID does not exist.
     pub fn get_metadata(&self, doc_id: u64) -> Result<Option<Metadata>, DatabaseError> {
-        match self.metadata.get(doc_id.to_be_bytes())? {
-            Some(bytes) => {
-                let metadata: Metadata = serde_json::from_slice(&bytes)?;
-                Ok(Some(metadata))
-            }
-            None => Ok(None),
-        }
-    }
-
-    // Retrieves the metadata for a given document ID. Returns None if the document ID does not exist.
-    pub fn get_metadata_by_path(&self, path: &Path) -> Result<Option<Metadata>, DatabaseError> {
-        let doc_id = match self.paths.get(path.to_string_lossy().as_bytes())? {
-            Some(bytes) => decode_u64_counter(&bytes)?,
-            None => return Ok(None),
-        };
-
         match self.metadata.get(doc_id.to_be_bytes())? {
             Some(bytes) => {
                 let metadata: Metadata = serde_json::from_slice(&bytes)?;
@@ -720,7 +769,7 @@ mod tests {
         let name_terms = HashSet::from(["example".to_string()]);
 
         let doc_id = db
-            .index_document(&metadata, "example.txt", &term_counts, &name_terms)
+            .index_document(&metadata, "example.txt", &term_counts, &name_terms, None)
             .expect("index_document failed");
 
         let stored = db.get_metadata(doc_id).expect("get_metadata failed");
@@ -744,6 +793,7 @@ mod tests {
             "reporte_final.txt",
             &HashMap::new(),
             &HashSet::new(),
+            None,
         )
         .expect("index_document failed");
 
@@ -766,7 +816,7 @@ mod tests {
         let name_terms = HashSet::from(["foto".to_string(), "vacaciones".to_string()]);
 
         let doc_id = db
-            .index_binary_and_image(&metadata, "foto_vacaciones.png", &name_terms)
+            .index_binary_and_image(&metadata, "foto_vacaciones.png", &name_terms, None)
             .expect("index_binary_and_image failed");
 
         let docs = db.get_name_docs("foto").expect("get_name_docs failed");
@@ -787,6 +837,7 @@ mod tests {
             "a.txt",
             &HashMap::from([("uno", 1)]),
             &HashSet::new(),
+            None,
         )
         .expect("index_document failed");
         db.index_document(
@@ -794,6 +845,7 @@ mod tests {
             "b.txt",
             &HashMap::from([("dos", 1)]),
             &HashSet::new(),
+            None,
         )
         .expect("index_document failed");
 
@@ -813,15 +865,16 @@ mod tests {
                 "example.txt",
                 &HashMap::from([("manzana", 1)]),
                 &HashSet::new(),
+                None,
             )
             .expect("index_document failed");
 
         let new_metadata = sample_metadata(FileType::Text, 1);
         let reindexed_id = db
             .reindex_text_document(
+                doc_id,
                 &new_metadata,
                 "example.txt",
-                1,
                 "example.txt",
                 &HashMap::from([("pera", 1)]),
                 &HashSet::new(),
@@ -846,13 +899,20 @@ mod tests {
         let (_dir, db) = open_db();
         let metadata = sample_metadata(FileType::Text, 1);
 
-        db.index_document(&metadata, "old_name.txt", &HashMap::new(), &HashSet::new())
+        let doc_id = db
+            .index_document(
+                &metadata,
+                "old_name.txt",
+                &HashMap::new(),
+                &HashSet::new(),
+                None,
+            )
             .expect("index_document failed");
 
         db.reindex_text_document(
+            doc_id,
             &metadata,
             "old_name.txt",
-            1,
             "new_name.txt",
             &HashMap::new(),
             &HashSet::new(),
@@ -876,13 +936,20 @@ mod tests {
         let (_dir, db) = open_db();
         let metadata = sample_metadata(FileType::Text, 1);
 
-        db.index_document(&metadata, "same.txt", &HashMap::new(), &HashSet::new())
+        let doc_id = db
+            .index_document(
+                &metadata,
+                "same.txt",
+                &HashMap::new(),
+                &HashSet::new(),
+                None,
+            )
             .expect("index_document failed");
 
         db.reindex_text_document(
+            doc_id,
             &metadata,
             "same.txt",
-            1,
             "same.txt",
             &HashMap::new(),
             &HashSet::new(),
@@ -899,18 +966,21 @@ mod tests {
     fn reindex_text_document_adjusts_stats_by_delta() {
         let (_dir, db) = open_db();
 
-        db.index_document(
-            &sample_metadata(FileType::Text, 4),
-            "a.txt",
-            &HashMap::new(),
-            &HashSet::new(),
-        )
-        .expect("index_document failed");
+        let doc_id = db
+            .index_document(
+                &sample_metadata(FileType::Text, 4),
+                "a.txt",
+                &HashMap::new(),
+                &HashSet::new(),
+                None,
+            )
+            .expect("index_document failed");
         db.index_document(
             &sample_metadata(FileType::Text, 6),
             "b.txt",
             &HashMap::new(),
             &HashSet::new(),
+            None,
         )
         .expect("index_document failed");
 
@@ -919,9 +989,9 @@ mod tests {
         assert!((stats.avg_total_terms - 5.0).abs() < f64::EPSILON);
 
         db.reindex_text_document(
+            doc_id,
             &sample_metadata(FileType::Text, 10),
             "a.txt",
-            4,
             "a.txt",
             &HashMap::new(),
             &HashSet::new(),
@@ -935,14 +1005,14 @@ mod tests {
     }
 
     #[test]
-    fn reindex_text_document_errors_when_path_was_never_indexed() {
+    fn reindex_text_document_errors_when_doc_id_was_never_indexed() {
         let (_dir, db) = open_db();
         let metadata = sample_metadata(FileType::Text, 1);
 
         let result = db.reindex_text_document(
+            999,
             &metadata,
             "example.txt",
-            0,
             "example.txt",
             &HashMap::new(),
             &HashSet::new(),
@@ -961,11 +1031,13 @@ mod tests {
                 &metadata,
                 "foto_vacaciones.png",
                 &HashSet::from(["foto".to_string(), "vacaciones".to_string()]),
+                None,
             )
             .expect("index_binary_and_image failed");
 
         let reindexed_id = db
             .reindex_binary_and_image(
+                doc_id,
                 &metadata,
                 "foto_vacaciones.png",
                 "foto_playa.png",

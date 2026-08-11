@@ -164,6 +164,7 @@ mod tests {
             "reporte_final.txt",
             &HashMap::new(),
             &HashSet::new(),
+            None,
         )
         .expect("index_document failed");
 
@@ -190,6 +191,7 @@ mod tests {
             "frutas.txt",
             &counts_a,
             &HashSet::new(),
+            None,
         )
         .expect("index_document failed");
 
@@ -207,6 +209,7 @@ mod tests {
             "otras.txt",
             &counts_b,
             &HashSet::new(),
+            None,
         )
         .expect("index_document failed");
 
@@ -228,6 +231,7 @@ mod tests {
             &metadata(FileType::Image, "/photos/2024_vacaciones.png", 0),
             &file_name,
             &name_terms,
+            None,
         )
         .expect("index_binary_and_image failed");
 
@@ -250,6 +254,7 @@ mod tests {
             "a.txt",
             &HashMap::from([("hola", 1)]),
             &HashSet::new(),
+            None,
         )
         .expect("index_document failed");
 

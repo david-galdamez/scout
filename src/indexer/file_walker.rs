@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -16,6 +15,7 @@ use crate::{
             process_binary_and_image_file, process_text_file,
         },
     },
+    util::{file_id, modified_secs},
 };
 
 #[derive(Debug, Error)]
@@ -32,8 +32,6 @@ pub enum DirErrors {
     SymlinkLoop,
     #[error("Database error: {0}")]
     DatabaseError(#[from] crate::database::DatabaseError),
-    #[error("File modified since it was indexed; reindexing isn't implemented yet")]
-    PendingReindex,
     #[error("File not indexed: {0}")]
     PathNotIndexed(PathBuf),
 }
@@ -128,8 +126,7 @@ fn validate_dir(dir: &Path) -> Result<(), DirErrors> {
 }
 
 // Classifies a file and dispatches it to the right processor. Only called for files that
-// `index_state` reports as `New` — `Modified` files are collected as `DirErrors::PendingReindex`
-// instead, since reusing this would mint a second doc_id for the same path.
+// `index_state` reports as `New`.
 fn index_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
     match classify(path)? {
         FileType::Text => process_text_file(path, db),
@@ -139,7 +136,8 @@ fn index_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
     }
 }
 
-// Reindexes a file that has been modified since it was last indexed. This function is currently not implemented and will return an error if called.
+// Reindexes a file that `index_state` reports as `Modified` (content changed, renamed, or
+// both), updating its existing doc instead of minting a new one.
 fn reindex_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
     match classify(path)? {
         FileType::Text => process_and_reindex_text_file(path, db),
@@ -149,11 +147,31 @@ fn reindex_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
     }
 }
 
-// Compares the file's current mtime against the mtime recorded in `Metadata` the last time
-// it was indexed (looked up via the `paths` tree) to tell new, unchanged, and modified files
-// apart.
+// Tells new, unchanged, and modified files apart. Primarily keys off the file's platform
+// identifier (`util::file_id`, stable across renames/moves) rather than its path: looks up
+// the doc last indexed under that identifier and compares its old path/mtime against the
+// file's current path/mtime, so a rename alone (same content, new path) is classified as
+// `Modified` just like a content change, instead of looking like a brand-new file. Falls back
+// to path-only comparison (today's behavior, blind to renames) when the platform/filesystem
+// can't provide an identifier — rare, but possible on some Windows volumes.
 fn index_state(path: &Path, db: &Database) -> Result<IndexState, DirErrors> {
-    let current_modified = std::fs::metadata(path)?.mtime().cast_unsigned();
+    let fs_metadata = std::fs::metadata(path)?;
+    let current_modified = modified_secs(&fs_metadata);
+
+    if let Some(id) = file_id(&fs_metadata) {
+        return Ok(match db.get_doc_id_by_file_id(id)? {
+            None => IndexState::New,
+            Some(doc_id) => match db.get_metadata(doc_id)? {
+                Some(old_metadata)
+                    if old_metadata.path == path && old_metadata.modified >= current_modified =>
+                {
+                    IndexState::Unchanged
+                }
+                Some(_) => IndexState::Modified,
+                None => IndexState::New,
+            },
+        });
+    }
 
     Ok(match db.get_file_modified_time(path)? {
         None => IndexState::New,

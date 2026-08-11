@@ -1,9 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{File, Metadata, metadata},
+    fs::{File, metadata},
     io::{BufRead, BufReader},
     path::Path,
-    time::UNIX_EPOCH,
 };
 
 use crate::{
@@ -12,15 +11,26 @@ use crate::{
         file_walker::DirErrors,
         tokenizer::{normalize_file_name, tokenize_file_name, tokenizer},
     },
+    util::{file_id, modified_secs},
 };
 
-// Converts `Metadata::modified()` into seconds since the Unix epoch. Times before the epoch
-// (clock skew, exotic filesystems) collapse to 0 rather than failing indexing over a bad mtime.
-fn modified_secs(metadata: &Metadata) -> u64 {
-    metadata
-        .modified()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).map_err(std::io::Error::other))
-        .map_or(0, |d| d.as_secs())
+// Resolves the doc_id an existing file was indexed under: tries the file's platform
+// identifier first (stable across renames), falling back to a path lookup when the platform
+// can't provide one (rare, e.g. some Windows volumes) or the doc predates the `file_ids` tree.
+fn resolve_doc_id(
+    path: &Path,
+    file_metadata: &std::fs::Metadata,
+    db: &Database,
+) -> Result<u64, DirErrors> {
+    let by_file_id = match file_id(file_metadata) {
+        Some(id) => db.get_doc_id_by_file_id(id)?,
+        None => None,
+    };
+    let doc_id = match by_file_id {
+        Some(doc_id) => Some(doc_id),
+        None => db.get_doc_id_by_path(path)?,
+    };
+    doc_id.ok_or_else(|| DirErrors::PathNotIndexed(path.to_path_buf()))
 }
 
 // Processes a text file, tokenizes its content, and indexes it in the database.
@@ -68,6 +78,7 @@ pub fn process_text_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
         &file_name,
         &counts,
         &file_name_tokens.into_iter().collect::<HashSet<String>>(),
+        file_id(&file_metadata),
     )?;
 
     Ok(())
@@ -101,6 +112,7 @@ pub fn process_binary_and_image_file(
         &metadata,
         &file_name,
         &file_name_tokens.into_iter().collect::<HashSet<String>>(),
+        file_id(&file_metadata),
     )?;
 
     Ok(())
@@ -131,12 +143,18 @@ pub fn process_and_reindex_text_file(path: &Path, db: &Database) -> Result<(), D
         doc_length: doc_lenght,
     };
 
-    let old_metadata = match db.get_metadata_by_path(path)? {
-        Some(old_metadata) => old_metadata,
-        None => {
-            return Err(DirErrors::PathNotIndexed(path.to_path_buf()));
-        }
+    let doc_id = resolve_doc_id(path, &file_metadata, db)?;
+    let Some(old_metadata) = db.get_metadata(doc_id)? else {
+        return Err(DirErrors::PathNotIndexed(path.to_path_buf()));
     };
+    let old_file_name = normalize_file_name(
+        old_metadata
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .as_ref(),
+    );
 
     let mut counts: HashMap<&str, u64> = HashMap::new();
 
@@ -154,14 +172,9 @@ pub fn process_and_reindex_text_file(path: &Path, db: &Database) -> Result<(), D
     let file_name_tokens = tokenize_file_name(&file_name);
 
     db.reindex_text_document(
+        doc_id,
         &metadata,
-        old_metadata
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .as_ref(),
-        old_metadata.doc_length,
+        &old_file_name,
         &file_name,
         &counts,
         &file_name_tokens.into_iter().collect::<HashSet<String>>(),
@@ -186,12 +199,18 @@ pub fn process_and_reindex_binary_and_images(
         doc_length: 0,
     };
 
-    let old_metadata = match db.get_metadata_by_path(path)? {
-        Some(old_metadata) => old_metadata,
-        None => {
-            return Err(DirErrors::PathNotIndexed(path.to_path_buf()));
-        }
+    let doc_id = resolve_doc_id(path, &file_metadata, db)?;
+    let Some(old_metadata) = db.get_metadata(doc_id)? else {
+        return Err(DirErrors::PathNotIndexed(path.to_path_buf()));
     };
+    let old_file_name = normalize_file_name(
+        old_metadata
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .as_ref(),
+    );
 
     let file_name = normalize_file_name(
         path.file_name()
@@ -202,13 +221,9 @@ pub fn process_and_reindex_binary_and_images(
     let file_name_tokens = tokenize_file_name(&file_name);
 
     db.reindex_binary_and_image(
+        doc_id,
         &metadata,
-        old_metadata
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .as_ref(),
+        &old_file_name,
         &file_name,
         &file_name_tokens.into_iter().collect::<HashSet<String>>(),
     )?;

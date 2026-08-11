@@ -35,7 +35,7 @@ indexer::walk_dirs(include, exclude, &db)
         for each file: index_state (new/unchanged/modified)
           new      -> classify -> process_text_file / process_binary_and_image_file -> db.index_document / db.index_binary_and_image
           unchanged -> skipped
-          modified  -> collected as DirErrors::PendingReindex (reindexing not implemented yet)
+          modified  -> classify -> process_and_reindex_text_file / process_and_reindex_binary_and_images -> db.reindex_text_document / db.reindex_binary_and_image
         |
         v
 search::Searcher::search(query)     ->  title-prefix match, else BM-25 over term tokens + file-name tokens
@@ -49,24 +49,49 @@ etc.). The sled database itself lives under the OS data dir (`dirs::data_dir()/s
 separate from the config file.
 
 ### `database` (`src/database/`)
-Wraps a `sled::Db` with six trees, defined in `schemas.rs`:
+Wraps a `sled::Db` with nine trees, defined in `schemas.rs`:
 - `metadata`: doc_id (u64 BE bytes) -> `Metadata` (path, size, mtime, `FileType`, doc_length)
-- `paths`: path string -> doc_id (u64 BE bytes); lets `get_file_modified_time` look up a
-  file's previously recorded mtime by path during the walk, without a doc_id in hand
+- `paths`: path string -> doc_id (u64 BE bytes); a secondary lookup kept in sync on every
+  write, used as the fallback identifier (see `file_ids` below) and by
+  `get_file_modified_time`/`get_doc_id_by_path`
+- `file_ids`: `FileId` bytes (`util::FileId` — device + inode on Unix, volume serial number +
+  file index on Windows, via `util::file_id`) -> doc_id (u64 BE bytes); the *primary* way an
+  existing doc is found again during a walk, because unlike `paths` it survives a rename
 - `file_names`: normalized file name -> `Vec<doc_id>` (multiple docs can share a file name)
 - `terms`: term -> `Vec<TermFrequency>` (doc_id + frequency), i.e. the inverted index over
   text content, populated only for `FileType::Text`
 - `name_terms`: file-name token (split on `_` too, via `tokenize_file_name`) -> `Vec<doc_id>`;
   populated for every file regardless of type, so binaries/images are findable by name
+- `document_terms` / `document_name_terms`: doc_id -> `Vec<String>`, the *reverse* of `terms`/
+  `name_terms` — the set of content/name tokens a given doc is currently indexed under. Exists
+  solely so reindexing can look up and remove a doc's stale postings from `terms`/`name_terms`
+  without scanning the whole vocabulary.
 - `stats`: aggregate counters (`n_text_docs`, `n_terms`, `n_binary_docs`, `n_image_docs`) used
   for BM-25 normalization via `get_stats` -> `Stats { total_text_docs, avg_total_terms }`
 
 `Database::index_document` and `Database::index_binary_and_image` (`repository.rs`) are the
-write paths: each generates a doc id via sled's atomic counter, then writes metadata/paths/
-file_names/(terms)/name_terms/stats inside **one sled transaction** across all the trees it
-touches, so a document is indexed atomically or not at all. `index_document` additionally
-writes to `terms` and bumps `n_text_docs`/`n_terms`; `index_binary_and_image` skips `terms`
-and bumps `n_binary_docs`/`n_image_docs` by `FileType`. `DatabaseError` wraps `sled::Error`
+fresh-index write paths: each generates a doc id via sled's atomic counter, then writes
+metadata/paths/(file_ids)/file_names/(terms)/name_terms/document_(name_)terms/stats inside
+**one sled transaction** across all the trees it touches, so a document is indexed atomically
+or not at all. Both take an `Option<FileId>` (`None` when the platform/filesystem couldn't
+provide one) and write it to `file_ids` only when `Some`. `index_document` additionally writes
+to `terms` and bumps `n_text_docs`/`n_terms`; `index_binary_and_image` skips `terms` and bumps
+`n_binary_docs`/`n_image_docs` by `FileType`.
+
+`Database::reindex_text_document` / `reindex_binary_and_image` are the update path for a doc
+that already exists. Unlike the fresh-index functions, they take an already-resolved `doc_id`
+as their first argument instead of looking one up by path — the caller (see `processors.rs`
+below) is expected to have resolved it via `file_ids` (surviving a rename), so these functions
+never assume `metadata.path` is unchanged. They read the doc's previous `Metadata` internally
+(for the old `doc_length`, used for the `stats` delta, and the old `path`, to know whether
+`paths` needs its stale entry removed and a new one inserted), read old postings from
+`document_terms`/`document_name_terms`, remove `doc_id` from the stale `terms`/`name_terms`/
+`file_names` entries (helpers `remove_stale_postings`/`remove_name_postings`, deleting a
+postings list entirely once empty), adjust `stats` by the doc_length delta (`decrease_stat`
+then `bump_stats`, rather than just adding again), and re-insert fresh postings
+(`insert_fresh_postings`/`insert_name_postings` — shared with the fresh-index path). Note they
+don't touch `file_ids`: a file's platform identifier doesn't change across a rename or edit,
+so the tree only ever needs writing once, at first index. `DatabaseError` wraps `sled::Error`
 and `serde_json::Error`; note the two-layer transaction error handling —
 `ConflictableTransactionError` inside the closure vs. `TransactionError` once it escapes
 `.transaction(...)`.
@@ -76,19 +101,29 @@ and `serde_json::Error`; note the two-layer transaction error handling —
   filtering out excluded directory names, and returns a `Vec<(PathBuf, DirErrors)>` of
   per-file/per-dir errors rather than failing the whole run (permission errors, symlink
   loops, I/O errors, and per-file indexing errors are all collected, not fatal). Before
-  indexing, `index_state` compares the file's current mtime against the mtime recorded in
-  `Metadata` (looked up via `Database::get_file_modified_time`, through the `paths` tree) to
-  classify it as `New`, `Unchanged`, or `Modified`: `Unchanged` files are skipped entirely,
-  `New` files go through `index_file` (classify -> process), and `Modified` files are only
-  flagged as `DirErrors::PendingReindex` — actually reindexing them (updating the existing
-  doc rather than minting a new doc_id) is not implemented yet.
+  indexing, `index_state` classifies each file as `New`, `Unchanged`, or `Modified`, primarily
+  by computing the file's `util::file_id` and looking it up via
+  `Database::get_doc_id_by_file_id`: no match is `New`; a match is `Unchanged` only if both
+  the stored path and mtime match the file's current path/mtime, otherwise `Modified` — so a
+  bare rename (same content, new path) is classified the same way as a content edit, rather
+  than looking like a brand-new file. Falls back to the old path-only comparison (via
+  `get_file_modified_time`, blind to renames) when the platform can't provide a `file_id`.
+  `New` files go through `index_file` (classify -> process_*), and `Modified` files go through
+  `reindex_file` (classify -> process_and_reindex_*).
 - `classifier.rs` / `extension_map.rs`: classifies a path as `Text`/`Image`/`Binary`, first
   by extension lookup (`EXTENSION_MAP`), falling back to content sniffing via
   `content_inspector::inspect` on the first 8KB when the extension is unknown.
-- `processors.rs`: `process_text_file` reads a text file line-by-line, tokenizes it, builds
-  metadata (using Unix-specific `MetadataExt` for size/mtime — Unix-only as written), counts
-  term frequencies, and calls `db.index_document`. `process_binary_and_image_file` builds
-  metadata with `doc_length: 0` and calls `db.index_binary_and_image`, so `Image`/`Binary`
+- `processors.rs`: `process_text_file`/`process_and_reindex_text_file` read a text file
+  line-by-line, tokenize it, build metadata via `std::fs::Metadata` + `util::modified_secs`
+  (cross-platform — no `MetadataExt` outside `util::file_id`), count term frequencies, and
+  call `db.index_document`/`db.reindex_text_document`. The reindex path resolves `doc_id` via
+  the shared `resolve_doc_id` helper (`file_id` lookup, falling back to `get_doc_id_by_path`
+  for docs that predate the `file_ids` tree or a platform without one), then reads the doc's
+  old `Metadata` to normalize its old file name for postings cleanup — passing an
+  *unnormalized* name here would silently no-op the cleanup, since `file_names`/`name_terms`
+  keys are always normalized. `process_binary_and_image_file`/
+  `process_and_reindex_binary_and_images` build metadata with `doc_length: 0` and call
+  `db.index_binary_and_image`/`db.reindex_binary_and_image` the same way, so `Image`/`Binary`
   files are indexed by file name/path only, with no content extraction.
 - `tokenizer.rs`: `tokenizer` lowercases, strips accents (`unicode-normalization` NFD +
   combining-mark filtering), splits on non-alphanumeric (except `_`), and filters a combined
@@ -117,20 +152,13 @@ matches:
 
 - Content extraction for `Image`/`Binary` files doesn't exist — they're only searchable by
   file name/path, never by content.
-- Modified files are detected (`IndexState::Modified` in `file_walker.rs`) but not yet
-  reindexed — they're currently just collected as `DirErrors::PendingReindex`. This is the
-  next planned piece of work: updating the existing doc (metadata, terms, name_terms, stats)
-  for a changed path instead of minting a new doc_id, and pruning stats/inverted-index
-  entries for the stale content.
 - Deleted files (present in the index but no longer on disk) aren't detected or pruned by
-  the walker at all yet.
-- Renames/moves aren't detected either, and are effectively a delete + create: since
-  `index_state`/`get_file_modified_time` key off the file's path (via the `paths` tree), a
-  renamed file's new path has no recorded entry, so it's indexed as `IndexState::New` with a
-  fresh `doc_id`, while the old path's `metadata`/`paths`/`terms`/`name_terms` entries are
-  left behind pointing at a file that no longer exists there. Fixing this needs an identifier
-  stable across renames — the standard approach is the file's inode (`MetadataExt::ino()`,
-  already Unix-only like the rest of `processors.rs`) instead of (or alongside) the path, so a
-  known inode showing up at a new path is recognized as a rename rather than a new document.
-- `processors.rs` uses `std::os::unix::fs::MetadataExt`, so the indexer as written is
-  Unix-only.
+  the walker at all yet — this is the natural next piece of work now that renames are
+  handled: a doc whose `file_id` is never seen again during a walk (and whose path no longer
+  exists) needs the same kind of cleanup `remove_stale_postings`/`remove_name_postings`
+  already do for reindexing, just triggered by absence instead of by a content change.
+- Cross-device/volume moves (a file moved to a different mount point or drive) get a new
+  `device` component in its `util::FileId`, so they're indistinguishable from a delete +
+  create with the current identifier scheme — same as a rename across filesystems on most
+  real tools. Not expected to matter for the common case (moving files within `~/Documents`,
+  say), but worth knowing if it comes up.

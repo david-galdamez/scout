@@ -78,6 +78,8 @@ pub struct Database {
     name_terms: Tree,
     stats: Tree,
     paths: Tree,
+    document_terms: Tree,
+    document_name_terms: Tree,
 }
 
 impl Database {
@@ -89,6 +91,8 @@ impl Database {
         let name_terms_tree = db.open_tree("name_terms")?;
         let stats_tree = db.open_tree("stats")?;
         let paths_tree = db.open_tree("paths")?;
+        let document_terms_tree = db.open_tree("document_terms")?;
+        let document_name_terms_tree = db.open_tree("document_name_terms")?;
 
         Ok(Self {
             db,
@@ -98,6 +102,8 @@ impl Database {
             name_terms: name_terms_tree,
             stats: stats_tree,
             paths: paths_tree,
+            document_terms: document_terms_tree,
+            document_name_terms: document_name_terms_tree,
         })
     }
 
@@ -124,6 +130,8 @@ impl Database {
             &self.name_terms,
             &self.stats,
             &self.paths,
+            &self.document_terms,
+            &self.document_name_terms,
         )
             .transaction(
                 |(
@@ -133,6 +141,8 @@ impl Database {
                     name_term_tree,
                     stats_tree,
                     paths_tree,
+                    document_terms_tree,
+                    document_name_tree,
                 )| {
                     metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
 
@@ -141,47 +151,26 @@ impl Database {
                         &doc_id.to_be_bytes(),
                     )?;
 
-                    let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
-                        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                            ConflictableTransactionError::Abort(DatabaseError::from(e))
-                        })?,
-                        None => Vec::new(),
-                    };
-                    doc_ids.push(doc_id);
-                    let ids_bytes = serde_json::to_vec(&doc_ids)
+                    let name_terms: Vec<String> = name_term.iter().cloned().collect();
+                    let name_terms_bytes = serde_json::to_vec(&name_terms)
                         .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
-                    file_names_tree.insert(file_name.as_bytes(), ids_bytes)?;
+                    document_name_tree.insert(&doc_id.to_be_bytes(), name_terms_bytes)?;
 
-                    for (term, count) in term_counts {
-                        let mut freqs: Vec<TermFrequency> = match terms_tree.get(*term)? {
-                            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                                ConflictableTransactionError::Abort(DatabaseError::from(e))
-                            })?,
-                            None => Vec::new(),
-                        };
-                        freqs.push(TermFrequency {
-                            doc_id,
-                            frequency: *count,
-                        });
-                        let freqs_bytes = serde_json::to_vec(&freqs).map_err(|e| {
-                            ConflictableTransactionError::Abort(DatabaseError::from(e))
-                        })?;
-                        terms_tree.insert(term.as_bytes(), freqs_bytes)?;
-                    }
+                    let doc_terms: Vec<String> =
+                        term_counts.keys().map(|k| String::from(*k)).collect();
+                    let doc_terms_byte = serde_json::to_vec(&doc_terms)
+                        .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+                    document_terms_tree.insert(&doc_id.to_be_bytes(), doc_terms_byte)?;
 
-                    for term in name_term {
-                        let mut freqs: Vec<u64> = match name_term_tree.get(term)? {
-                            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                                ConflictableTransactionError::Abort(DatabaseError::from(e))
-                            })?,
-                            None => Vec::new(),
-                        };
-                        freqs.push(doc_id);
-                        let freqs_bytes = serde_json::to_vec(&freqs).map_err(|e| {
-                            ConflictableTransactionError::Abort(DatabaseError::from(e))
-                        })?;
-                        name_term_tree.insert(term.as_bytes(), freqs_bytes)?;
-                    }
+                    Self::insert_fresh_postings(
+                        terms_tree,
+                        name_term_tree,
+                        file_names_tree,
+                        term_counts,
+                        name_term,
+                        file_name,
+                        doc_id,
+                    )?;
 
                     Self::bump_stats(stats_tree, "n_text_docs", 1)?;
                     Self::bump_stats(stats_tree, "n_terms", doc_length)?;
@@ -213,9 +202,17 @@ impl Database {
             &self.name_terms,
             &self.stats,
             &self.paths,
+            &self.document_name_terms,
         )
             .transaction(
-                |(metadata_tree, file_names_tree, name_term_tree, stats_tree, paths_tree)| {
+                |(
+                    metadata_tree,
+                    file_names_tree,
+                    name_term_tree,
+                    stats_tree,
+                    paths_tree,
+                    document_name_tree,
+                )| {
                     metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
 
                     paths_tree.insert(
@@ -223,37 +220,322 @@ impl Database {
                         &doc_id.to_be_bytes(),
                     )?;
 
-                    let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
-                        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                            ConflictableTransactionError::Abort(DatabaseError::from(e))
-                        })?,
-                        None => Vec::new(),
-                    };
-                    doc_ids.push(doc_id);
-
-                    let ids_bytes = serde_json::to_vec(&doc_ids)
+                    let name_terms: Vec<String> = name_term.iter().cloned().collect();
+                    let name_terms_bytes = serde_json::to_vec(&name_terms)
                         .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
-                    file_names_tree.insert(file_name.as_bytes(), ids_bytes)?;
+                    document_name_tree.insert(&doc_id.to_be_bytes(), name_terms_bytes)?;
 
-                    for term in name_term {
-                        let mut freqs: Vec<u64> = match name_term_tree.get(term)? {
-                            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                                ConflictableTransactionError::Abort(DatabaseError::from(e))
-                            })?,
-                            None => Vec::new(),
-                        };
-                        freqs.push(doc_id);
-                        let freqs_bytes = serde_json::to_vec(&freqs).map_err(|e| {
-                            ConflictableTransactionError::Abort(DatabaseError::from(e))
-                        })?;
-                        name_term_tree.insert(term.as_bytes(), freqs_bytes)?;
-                    }
+                    Self::insert_name_postings(
+                        name_term_tree,
+                        file_names_tree,
+                        name_term,
+                        file_name,
+                        doc_id,
+                    )?;
 
                     match metadata.kind {
                         FileType::Binary => Self::bump_stats(stats_tree, "n_binary_docs", 1)?,
                         FileType::Image => Self::bump_stats(stats_tree, "n_image_docs", 1)?,
                         FileType::Text => {}
                     }
+
+                    Ok(())
+                },
+            )?;
+
+        Ok(doc_id)
+    }
+
+    // Removes `doc_id` from the postings of its old name terms and file name entry, deleting
+    // any postings list that becomes empty. Shared by `Text` and `Binary`/`Image` removal.
+    fn remove_name_postings(
+        name_term_tree: &TransactionalTree,
+        file_names_tree: &TransactionalTree,
+        old_name_terms: &[String],
+        old_file_name: &str,
+        doc_id: u64,
+    ) -> Result<(), ConflictableTransactionError<DatabaseError>> {
+        for term in old_name_terms {
+            let mut doc_ids: Vec<u64> = match name_term_tree.get(term)? {
+                Some(bytes) => serde_json::from_slice(&bytes)
+                    .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?,
+                None => Vec::new(),
+            };
+            doc_ids.retain(|&id| id != doc_id);
+            if doc_ids.is_empty() {
+                name_term_tree.remove(term.as_bytes())?;
+            } else {
+                let ids_bytes = serde_json::to_vec(&doc_ids)
+                    .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+                name_term_tree.insert(term.as_bytes(), ids_bytes)?;
+            }
+        }
+
+        let mut doc_ids: Vec<u64> = match file_names_tree.get(old_file_name.as_bytes())? {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?,
+            None => Vec::new(),
+        };
+        doc_ids.retain(|&id| id != doc_id);
+        if doc_ids.is_empty() {
+            file_names_tree.remove(old_file_name.as_bytes())?;
+        } else {
+            let ids_bytes = serde_json::to_vec(&doc_ids)
+                .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+            file_names_tree.insert(old_file_name.as_bytes(), ids_bytes)?;
+        }
+
+        Ok(())
+    }
+
+    // Removes `doc_id` from the postings of its old content terms, name terms, and file name
+    // entry, deleting any postings list that becomes empty. Shared by the removal half of
+    // `reindex_text_document`.
+    fn remove_stale_postings(
+        terms_tree: &TransactionalTree,
+        name_term_tree: &TransactionalTree,
+        file_names_tree: &TransactionalTree,
+        old_doc_terms: &[String],
+        old_name_terms: &[String],
+        old_file_name: &str,
+        doc_id: u64,
+    ) -> Result<(), ConflictableTransactionError<DatabaseError>> {
+        for term in old_doc_terms {
+            let mut freqs: Vec<TermFrequency> = match terms_tree.get(term)? {
+                Some(bytes) => serde_json::from_slice(&bytes)
+                    .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?,
+                None => Vec::new(),
+            };
+            freqs.retain(|f| f.doc_id != doc_id);
+            if freqs.is_empty() {
+                terms_tree.remove(term.as_bytes())?;
+            } else {
+                let freqs_bytes = serde_json::to_vec(&freqs)
+                    .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+                terms_tree.insert(term.as_bytes(), freqs_bytes)?;
+            }
+        }
+
+        Self::remove_name_postings(
+            name_term_tree,
+            file_names_tree,
+            old_name_terms,
+            old_file_name,
+            doc_id,
+        )
+    }
+
+    // Adds `doc_id` to the postings of its current name terms and file name entry. Shared by
+    // `Text` and `Binary`/`Image` insertion.
+    fn insert_name_postings(
+        name_term_tree: &TransactionalTree,
+        file_names_tree: &TransactionalTree,
+        name_term: &HashSet<String>,
+        file_name: &str,
+        doc_id: u64,
+    ) -> Result<(), ConflictableTransactionError<DatabaseError>> {
+        let mut doc_ids: Vec<u64> = match file_names_tree.get(file_name)? {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?,
+            None => Vec::new(),
+        };
+        doc_ids.push(doc_id);
+        let ids_bytes = serde_json::to_vec(&doc_ids)
+            .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+        file_names_tree.insert(file_name.as_bytes(), ids_bytes)?;
+
+        for term in name_term {
+            let mut doc_ids: Vec<u64> = match name_term_tree.get(term)? {
+                Some(bytes) => serde_json::from_slice(&bytes)
+                    .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?,
+                None => Vec::new(),
+            };
+            doc_ids.push(doc_id);
+            let ids_bytes = serde_json::to_vec(&doc_ids)
+                .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+            name_term_tree.insert(term.as_bytes(), ids_bytes)?;
+        }
+
+        Ok(())
+    }
+
+    // Adds `doc_id` to the postings of its current content terms, name terms, and file name
+    // entry. Shared by the insertion half of `reindex_text_document`.
+    fn insert_fresh_postings(
+        terms_tree: &TransactionalTree,
+        name_term_tree: &TransactionalTree,
+        file_names_tree: &TransactionalTree,
+        term_counts: &HashMap<&str, u64>,
+        name_term: &HashSet<String>,
+        file_name: &str,
+        doc_id: u64,
+    ) -> Result<(), ConflictableTransactionError<DatabaseError>> {
+        Self::insert_name_postings(
+            name_term_tree,
+            file_names_tree,
+            name_term,
+            file_name,
+            doc_id,
+        )?;
+
+        for (term, count) in term_counts {
+            let mut freqs: Vec<TermFrequency> = match terms_tree.get(*term)? {
+                Some(bytes) => serde_json::from_slice(&bytes)
+                    .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?,
+                None => Vec::new(),
+            };
+            freqs.push(TermFrequency {
+                doc_id,
+                frequency: *count,
+            });
+            let freqs_bytes = serde_json::to_vec(&freqs)
+                .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+            terms_tree.insert(term.as_bytes(), freqs_bytes)?;
+        }
+
+        Ok(())
+    }
+
+    // Reindexes a text document by updating its metadata, file name, and term frequencies in the database.
+    pub fn reindex_text_document(
+        &self,
+        metadata: &Metadata,
+        old_file_name: &str,
+        old_doc_lenght: u64,
+        file_name: &str,
+        term_counts: &HashMap<&str, u64>,
+        name_term: &HashSet<String>,
+    ) -> Result<u64, DatabaseError> {
+        let doc_id = match self.paths.get(metadata.path.to_string_lossy().as_bytes())? {
+            Some(bytes) => decode_u64_counter(&bytes)?,
+            None => return Err(DatabaseError::CollectionNotFound),
+        };
+
+        let old_name_terms: Vec<String> =
+            match self.document_name_terms.get(doc_id.to_be_bytes())? {
+                Some(bytes) => serde_json::from_slice(&bytes)?,
+                None => Vec::new(),
+            };
+        let old_doc_terms: Vec<String> = match self.document_terms.get(doc_id.to_be_bytes())? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
+            None => Vec::new(),
+        };
+
+        let metadata_bytes = serde_json::to_vec(metadata)?;
+        (
+            &self.metadata,
+            &self.file_names,
+            &self.terms,
+            &self.name_terms,
+            &self.stats,
+            &self.document_terms,
+            &self.document_name_terms,
+        )
+            .transaction(
+                |(
+                    metadata_tree,
+                    file_names_tree,
+                    terms_tree,
+                    name_term_tree,
+                    stats_tree,
+                    document_terms_tree,
+                    document_name_tree,
+                )| {
+                    Self::remove_stale_postings(
+                        terms_tree,
+                        name_term_tree,
+                        file_names_tree,
+                        &old_doc_terms,
+                        &old_name_terms,
+                        old_file_name,
+                        doc_id,
+                    )?;
+                    Self::decrease_stat(stats_tree, "n_terms", old_doc_lenght)?;
+
+                    metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
+
+                    let name_terms: Vec<String> = name_term.iter().cloned().collect();
+                    let name_terms_bytes = serde_json::to_vec(&name_terms)
+                        .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+                    document_name_tree.insert(&doc_id.to_be_bytes(), name_terms_bytes)?;
+
+                    let doc_terms: Vec<String> =
+                        term_counts.keys().map(|k| String::from(*k)).collect();
+                    let doc_terms_bytes = serde_json::to_vec(&doc_terms)
+                        .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+                    document_terms_tree.insert(&doc_id.to_be_bytes(), doc_terms_bytes)?;
+
+                    Self::insert_fresh_postings(
+                        terms_tree,
+                        name_term_tree,
+                        file_names_tree,
+                        term_counts,
+                        name_term,
+                        file_name,
+                        doc_id,
+                    )?;
+
+                    Self::bump_stats(stats_tree, "n_terms", metadata.doc_length)?;
+
+                    Ok(())
+                },
+            )?;
+
+        Ok(doc_id)
+    }
+
+    // Reindexes a binary/image document by updating its metadata and name terms in the
+    // database. Same shape as `reindex_text_document`, minus everything that only applies to
+    // text content (the `terms` tree, `document_terms`, and the `n_terms` stat delta).
+    pub fn reindex_binary_and_image(
+        &self,
+        metadata: &Metadata,
+        old_file_name: &str,
+        file_name: &str,
+        name_term: &HashSet<String>,
+    ) -> Result<u64, DatabaseError> {
+        let doc_id = match self.paths.get(metadata.path.to_string_lossy().as_bytes())? {
+            Some(bytes) => decode_u64_counter(&bytes)?,
+            None => return Err(DatabaseError::CollectionNotFound),
+        };
+
+        let old_name_terms: Vec<String> =
+            match self.document_name_terms.get(doc_id.to_be_bytes())? {
+                Some(bytes) => serde_json::from_slice(&bytes)?,
+                None => Vec::new(),
+            };
+
+        let metadata_bytes = serde_json::to_vec(metadata)?;
+        (
+            &self.metadata,
+            &self.file_names,
+            &self.name_terms,
+            &self.document_name_terms,
+        )
+            .transaction(
+                |(metadata_tree, file_names_tree, name_term_tree, document_name_tree)| {
+                    Self::remove_name_postings(
+                        name_term_tree,
+                        file_names_tree,
+                        &old_name_terms,
+                        old_file_name,
+                        doc_id,
+                    )?;
+
+                    metadata_tree.insert(&doc_id.to_be_bytes(), metadata_bytes.clone())?;
+
+                    let name_terms: Vec<String> = name_term.iter().cloned().collect();
+                    let name_terms_bytes = serde_json::to_vec(&name_terms)
+                        .map_err(|e| ConflictableTransactionError::Abort(DatabaseError::from(e)))?;
+                    document_name_tree.insert(&doc_id.to_be_bytes(), name_terms_bytes)?;
+
+                    Self::insert_name_postings(
+                        name_term_tree,
+                        file_names_tree,
+                        name_term,
+                        file_name,
+                        doc_id,
+                    )?;
 
                     Ok(())
                 },
@@ -294,8 +576,40 @@ impl Database {
         Ok(())
     }
 
+    // Bumps a counter in the stats tree by a given amount. If the key doesn't exist, it initializes it to 0 before adding.
+    fn decrease_stat(
+        stats_tree: &TransactionalTree,
+        key: &str,
+        counter: u64,
+    ) -> Result<(), ConflictableTransactionError<DatabaseError>> {
+        let n_docs = stats_tree
+            .get(key)?
+            .map(|bytes| decode_u64_counter(&bytes))
+            .transpose()
+            .map_err(ConflictableTransactionError::Abort)?
+            .unwrap_or(0);
+        stats_tree.insert(key, n_docs.saturating_sub(counter).to_be_bytes().to_vec())?;
+        Ok(())
+    }
+
     // Retrieves the metadata for a given document ID. Returns None if the document ID does not exist.
     pub fn get_metadata(&self, doc_id: u64) -> Result<Option<Metadata>, DatabaseError> {
+        match self.metadata.get(doc_id.to_be_bytes())? {
+            Some(bytes) => {
+                let metadata: Metadata = serde_json::from_slice(&bytes)?;
+                Ok(Some(metadata))
+            }
+            None => Ok(None),
+        }
+    }
+
+    // Retrieves the metadata for a given document ID. Returns None if the document ID does not exist.
+    pub fn get_metadata_by_path(&self, path: &Path) -> Result<Option<Metadata>, DatabaseError> {
+        let doc_id = match self.paths.get(path.to_string_lossy().as_bytes())? {
+            Some(bytes) => decode_u64_counter(&bytes)?,
+            None => return Ok(None),
+        };
+
         match self.metadata.get(doc_id.to_be_bytes())? {
             Some(bytes) => {
                 let metadata: Metadata = serde_json::from_slice(&bytes)?;
@@ -486,5 +800,203 @@ mod tests {
         let stats = db.get_stats().expect("get_stats failed");
         assert_eq!(stats.total_text_docs, 2);
         assert!((stats.avg_total_terms - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reindex_text_document_replaces_stale_terms_and_reuses_doc_id() {
+        let (_dir, db) = open_db();
+        let metadata = sample_metadata(FileType::Text, 1);
+
+        let doc_id = db
+            .index_document(
+                &metadata,
+                "example.txt",
+                &HashMap::from([("manzana", 1)]),
+                &HashSet::new(),
+            )
+            .expect("index_document failed");
+
+        let new_metadata = sample_metadata(FileType::Text, 1);
+        let reindexed_id = db
+            .reindex_text_document(
+                &new_metadata,
+                "example.txt",
+                1,
+                "example.txt",
+                &HashMap::from([("pera", 1)]),
+                &HashSet::new(),
+            )
+            .expect("reindex_text_document failed");
+
+        assert_eq!(reindexed_id, doc_id);
+        assert!(
+            db.get_term_frequencies("manzana")
+                .expect("get_term_frequencies failed")
+                .is_empty()
+        );
+        let freqs = db
+            .get_term_frequencies("pera")
+            .expect("get_term_frequencies failed");
+        assert_eq!(freqs.len(), 1);
+        assert_eq!(freqs[0].doc_id, doc_id);
+    }
+
+    #[test]
+    fn reindex_text_document_moves_file_name_entry_on_rename() {
+        let (_dir, db) = open_db();
+        let metadata = sample_metadata(FileType::Text, 1);
+
+        db.index_document(&metadata, "old_name.txt", &HashMap::new(), &HashSet::new())
+            .expect("index_document failed");
+
+        db.reindex_text_document(
+            &metadata,
+            "old_name.txt",
+            1,
+            "new_name.txt",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .expect("reindex_text_document failed");
+
+        assert!(
+            db.get_prefix_files("old_name")
+                .expect("get_prefix_files failed")
+                .is_empty()
+        );
+        let files = db
+            .get_prefix_files("new_name")
+            .expect("get_prefix_files failed");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, metadata.path);
+    }
+
+    #[test]
+    fn reindex_text_document_does_not_duplicate_file_names_entry_when_name_unchanged() {
+        let (_dir, db) = open_db();
+        let metadata = sample_metadata(FileType::Text, 1);
+
+        db.index_document(&metadata, "same.txt", &HashMap::new(), &HashSet::new())
+            .expect("index_document failed");
+
+        db.reindex_text_document(
+            &metadata,
+            "same.txt",
+            1,
+            "same.txt",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .expect("reindex_text_document failed");
+
+        let files = db
+            .get_prefix_files("same")
+            .expect("get_prefix_files failed");
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn reindex_text_document_adjusts_stats_by_delta() {
+        let (_dir, db) = open_db();
+
+        db.index_document(
+            &sample_metadata(FileType::Text, 4),
+            "a.txt",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .expect("index_document failed");
+        db.index_document(
+            &sample_metadata(FileType::Text, 6),
+            "b.txt",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .expect("index_document failed");
+
+        // avg is (4 + 6) / 2 = 5 before reindexing.
+        let stats = db.get_stats().expect("get_stats failed");
+        assert!((stats.avg_total_terms - 5.0).abs() < f64::EPSILON);
+
+        db.reindex_text_document(
+            &sample_metadata(FileType::Text, 10),
+            "a.txt",
+            4,
+            "a.txt",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .expect("reindex_text_document failed");
+
+        // avg is now (10 + 6) / 2 = 8 after growing the first doc from 4 to 10 terms.
+        let stats = db.get_stats().expect("get_stats failed");
+        assert_eq!(stats.total_text_docs, 2);
+        assert!((stats.avg_total_terms - 8.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reindex_text_document_errors_when_path_was_never_indexed() {
+        let (_dir, db) = open_db();
+        let metadata = sample_metadata(FileType::Text, 1);
+
+        let result = db.reindex_text_document(
+            &metadata,
+            "example.txt",
+            0,
+            "example.txt",
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+
+        assert!(matches!(result, Err(DatabaseError::CollectionNotFound)));
+    }
+
+    #[test]
+    fn reindex_binary_and_image_replaces_stale_name_terms_and_reuses_doc_id() {
+        let (_dir, db) = open_db();
+        let metadata = sample_metadata(FileType::Image, 0);
+
+        let doc_id = db
+            .index_binary_and_image(
+                &metadata,
+                "foto_vacaciones.png",
+                &HashSet::from(["foto".to_string(), "vacaciones".to_string()]),
+            )
+            .expect("index_binary_and_image failed");
+
+        let reindexed_id = db
+            .reindex_binary_and_image(
+                &metadata,
+                "foto_vacaciones.png",
+                "foto_playa.png",
+                &HashSet::from(["foto".to_string(), "playa".to_string()]),
+            )
+            .expect("reindex_binary_and_image failed");
+
+        assert_eq!(reindexed_id, doc_id);
+        assert!(
+            db.get_name_docs("vacaciones")
+                .expect("get_name_docs failed")
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_name_docs("playa").expect("get_name_docs failed"),
+            vec![doc_id]
+        );
+        assert_eq!(
+            db.get_name_docs("foto").expect("get_name_docs failed"),
+            vec![doc_id]
+        );
+        assert!(
+            db.get_prefix_files("foto_vacaciones")
+                .expect("get_prefix_files failed")
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_prefix_files("foto_playa")
+                .expect("get_prefix_files failed")
+                .len(),
+            1
+        );
     }
 }

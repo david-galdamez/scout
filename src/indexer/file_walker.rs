@@ -11,7 +11,10 @@ use crate::{
     database::{Database, FileType},
     indexer::{
         classifier::classify,
-        processors::{process_binary_and_image_file, process_text_file},
+        processors::{
+            process_and_reindex_binary_and_images, process_and_reindex_text_file,
+            process_binary_and_image_file, process_text_file,
+        },
     },
 };
 
@@ -31,6 +34,8 @@ pub enum DirErrors {
     DatabaseError(#[from] crate::database::DatabaseError),
     #[error("File modified since it was indexed; reindexing isn't implemented yet")]
     PendingReindex,
+    #[error("File not indexed: {0}")]
+    PathNotIndexed(PathBuf),
 }
 
 // Whether a file is being seen for the first time, is unchanged since the last time it was
@@ -70,8 +75,9 @@ pub fn walk_dirs(
                                 }
                             }
                             Ok(IndexState::Modified) => {
-                                errors
-                                    .push((entry.path().to_path_buf(), DirErrors::PendingReindex));
+                                if let Err(e) = reindex_file(entry.path(), db) {
+                                    errors.push((entry.path().to_path_buf(), e));
+                                }
                             }
                             Err(e) => errors.push((entry.path().to_path_buf(), e)),
                         }
@@ -129,6 +135,16 @@ fn index_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
         FileType::Text => process_text_file(path, db),
         file_type @ (FileType::Binary | FileType::Image) => {
             process_binary_and_image_file(path, db, file_type)
+        }
+    }
+}
+
+// Reindexes a file that has been modified since it was last indexed. This function is currently not implemented and will return an error if called.
+fn reindex_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
+    match classify(path)? {
+        FileType::Text => process_and_reindex_text_file(path, db),
+        file_type @ (FileType::Binary | FileType::Image) => {
+            process_and_reindex_binary_and_images(path, db, file_type)
         }
     }
 }

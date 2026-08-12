@@ -38,6 +38,9 @@ indexer::walk_dirs(include, exclude, &db)
           modified  -> classify -> process_and_reindex_text_file / process_and_reindex_binary_and_images -> db.reindex_text_document / db.reindex_binary_and_image
         |
         v
+        after the walk: any indexed file_id not seen during it -> prune_stale_file -> db.delete_document
+        |
+        v
 search::Searcher::search(query)     ->  title-prefix match, else BM-25 over term tokens + file-name tokens
 ```
 
@@ -96,6 +99,17 @@ and `serde_json::Error`; note the two-layer transaction error handling —
 `ConflictableTransactionError` inside the closure vs. `TransactionError` once it escapes
 `.transaction(...)`.
 
+`Database::delete_document(file_id, file_name)` is the removal path for a doc whose file no
+longer exists on disk. It resolves `doc_id` via `file_ids` (erroring with
+`DatabaseError::CollectionNotFound` if the id or its `Metadata` is missing), reads its old
+`document_terms`/`document_name_terms` for cleanup, then in one transaction removes it from
+`metadata`, `document_terms`, `document_name_terms`, `paths`, and `file_ids`, strips its
+postings from `terms`/`name_terms`/`file_names` (`remove_stale_postings`, shared with the
+reindex path), and decrements the right `stats` counter by `FileType` (`n_text_docs`/`n_terms`
+for `Text`, `n_binary_docs`/`n_image_docs` for `Binary`/`Image`). `Database::get_all_file_ids`
+returns every key currently in the `file_ids` tree, as raw `IVec`s, for the walker to diff
+against what it saw.
+
 ### `indexer` (`src/indexer/`)
 - `file_walker.rs`: `walk_dirs` uses `walkdir::WalkDir` per configured include directory,
   filtering out excluded directory names, and returns a `Vec<(PathBuf, DirErrors)>` of
@@ -109,7 +123,16 @@ and `serde_json::Error`; note the two-layer transaction error handling —
   than looking like a brand-new file. Falls back to the old path-only comparison (via
   `get_file_modified_time`, blind to renames) when the platform can't provide a `file_id`.
   `New` files go through `index_file` (classify -> process_*), and `Modified` files go through
-  `reindex_file` (classify -> process_and_reindex_*).
+  `reindex_file` (classify -> process_and_reindex_*). `index_state` also records every file's
+  `FileId` (as raw bytes) into a `visited_file_ids` set threaded through the whole walk. Once
+  every configured directory has been walked, `walk_dirs` diffs that set against
+  `Database::get_all_file_ids` (via `FileId::from_bytes`, which returns `None` — skipped rather
+  than erroring — for a key of the wrong length) and calls `prune_stale_file` for every indexed
+  `file_id` that wasn't visited: it looks up the doc's old `Metadata` to normalize its file name,
+  then calls `db.delete_document`, no-oping rather than erroring if the id or doc has already
+  vanished (e.g. a race with another prune). This is how deletes and moves-out-of-scope get
+  reflected in the index — a file whose `file_id` is never seen again during a walk is treated
+  as gone.
 - `classifier.rs` / `extension_map.rs`: classifies a path as `Text`/`Image`/`Binary`, first
   by extension lookup (`EXTENSION_MAP`), falling back to content sniffing via
   `content_inspector::inspect` on the first 8KB when the extension is unknown.
@@ -152,13 +175,15 @@ matches:
 
 - Content extraction for `Image`/`Binary` files doesn't exist — they're only searchable by
   file name/path, never by content.
-- Deleted files (present in the index but no longer on disk) aren't detected or pruned by
-  the walker at all yet — this is the natural next piece of work now that renames are
-  handled: a doc whose `file_id` is never seen again during a walk (and whose path no longer
-  exists) needs the same kind of cleanup `remove_stale_postings`/`remove_name_postings`
-  already do for reindexing, just triggered by absence instead of by a content change.
 - Cross-device/volume moves (a file moved to a different mount point or drive) get a new
   `device` component in its `util::FileId`, so they're indistinguishable from a delete +
-  create with the current identifier scheme — same as a rename across filesystems on most
-  real tools. Not expected to matter for the common case (moving files within `~/Documents`,
-  say), but worth knowing if it comes up.
+  create with the current identifier scheme — the old doc gets pruned by `prune_stale_file`
+  and the file is re-indexed under a fresh `doc_id`. Since `include` paths are user-editable
+  (arbitrary directories can be added/removed, potentially spanning different disks/mounts),
+  this isn't just a rare edge case — a user moving files between two indexed volumes will hit
+  it. Left unhandled for now as a known limitation: search results are unaffected (the file is
+  still found either way), the cost is re-reading/re-tokenizing large text files instead of a
+  cheap `file_id` rewrite, and losing `doc_id` continuity doesn't matter yet since nothing
+  references `doc_id` outside the database itself. Revisit if either becomes a real cost —
+  e.g. once a feature hangs metadata off `doc_id` (favorites, history) or this shows up as a
+  perf problem on large files moved across volumes.

@@ -48,7 +48,7 @@ enum IndexState {
 
 // Walks through the provided directories, classifies files, and processes them accordingly. Returns a vector of errors encountered during the walk.
 pub fn walk_dirs(
-    dirs: Vec<PathBuf>,
+    dirs: &Vec<PathBuf>,
     exclude: &HashSet<String>,
     db: &Database,
 ) -> Vec<(PathBuf, DirErrors)> {

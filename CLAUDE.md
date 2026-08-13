@@ -233,3 +233,25 @@ ignores it) — surfacing indexing status in the UI is still open.
   references `doc_id` outside the database itself. Revisit if either becomes a real cost —
   e.g. once a feature hangs metadata off `doc_id` (favorites, history) or this shows up as a
   perf problem on large files moved across volumes.
+- Indexing status isn't shown anywhere in the TUI. `run.rs` receives `IndexingEvent` but
+  ignores it (`_: Receiver<IndexingEvent>`), and the key-read loop blocks on
+  `event::read()`, so even wiring the receiver into `App` wouldn't refresh the screen between
+  keypresses. Needs both: `App` state for the latest `IndexingEvent` (e.g. an `IndexStatus`
+  enum rendered in the results-screen footer or a corner of `Home`), and switching the event
+  loop from a blocking read to a poll with a short timeout (`event::poll(Duration)`) so each
+  tick can also drain the channel with `rx.try_recv()` and redraw on new indexing events, not
+  just on keypresses.
+- No way to manage `include`/`exclude` directories from inside the TUI — today that's only
+  `~/.scout.toml`, hand-edited outside the app. Needs a new screen (e.g. reachable from `Home`)
+  listing configured directories, plus keys to add a directory (probably a text-entry prompt,
+  mirroring the query box) and remove one (from a navigable list, same `List`/`ListState`
+  pattern as the results screen) — and a way to push those changes back into `Config` and
+  persist them to the TOML file, not just `App` state.
+- Results are minimal today (`draw_results` in `ui.rs`): file name + path only. Worth showing
+  more of `Metadata` per row or in a detail pane when a result is selected — `size`,
+  `modified`, `kind` (`FileType`) are all already stored and available, just not surfaced.
+- Opening the selected document (in the OS's file explorer, or directly) is not implemented.
+  Mouse support is already on (`EnableMouseCapture` in `run.rs`), so a click on a result row is
+  plausible alongside an Enter-based shortcut once the interaction is designed — still being
+  thought through, so no committed approach yet (which OS-specific command/crate to shell out
+  to, whether "open" means reveal-in-explorer vs. open-with-default-app, etc.).

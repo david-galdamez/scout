@@ -56,7 +56,7 @@ pub fn walk_dirs(
     let mut visited_file_ids: HashSet<IVec> = HashSet::new();
 
     for dir in dirs {
-        if let Err(e) = validate_dir(&dir) {
+        if let Err(e) = validate_dir(dir) {
             errors.push((dir.clone(), e));
             continue;
         }

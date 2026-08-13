@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Scout is a local file search engine written in Rust. It recursively indexes files from
 user-configured directories, tokenizes text content, and stores an inverted index in an
 embedded `sled` database, searchable via title-prefix match, file-name-token match, and
-BM-25 ranking. A `ratatui` TUI is planned as the frontend (module currently a stub).
+BM-25 ranking. A `ratatui` TUI is the frontend, backed by a periodic indexing pass that runs
+on its own thread so the UI is never blocked on a walk.
 
 ## Commands
 
@@ -26,22 +27,25 @@ Pipeline, wired together in `src/main.rs`:
 config::load_and_validate_config()  ->  Config
         |
         v
-Database::new(db_path)              ->  sled-backed Database
-        |
-        v
-indexer::walk_dirs(include, exclude, &db)
-        |
-        v
-        for each file: index_state (new/unchanged/modified)
-          new      -> classify -> process_text_file / process_binary_and_image_file -> db.index_document / db.index_binary_and_image
-          unchanged -> skipped
-          modified  -> classify -> process_and_reindex_text_file / process_and_reindex_binary_and_images -> db.reindex_text_document / db.reindex_binary_and_image
-        |
-        v
-        after the walk: any indexed file_id not seen during it -> prune_stale_file -> db.delete_document
-        |
-        v
+Database::new(db_path)              ->  sled-backed Database  ---clone()---> background thread
+        |                                                              |
+        v                                                              v
+tui::run(db, index_rx)                                    loop { walk_dirs(...); sleep(5 min) }
+   (blocks until the user quits)                                       |
+                                                                        v
+                                                    indexer::walk_dirs(include, exclude, &db)
+                                                            |
+                                                            v
+                                                for each file: index_state (new/unchanged/modified)
+                                                  new      -> classify -> process_text_file / process_binary_and_image_file -> db.index_document / db.index_binary_and_image
+                                                  unchanged -> skipped
+                                                  modified  -> classify -> process_and_reindex_text_file / process_and_reindex_binary_and_images -> db.reindex_text_document / db.reindex_binary_and_image
+                                                            |
+                                                            v
+                                                after the walk: any indexed file_id not seen during it -> prune_stale_file -> db.delete_document
+
 search::Searcher::search(query)     ->  title-prefix match, else BM-25 over term tokens + file-name tokens
+                                          (called directly from the TUI's own `Database` clone on every Enter)
 ```
 
 ### `config`
@@ -168,8 +172,50 @@ matches:
    whose name matches but whose content doesn't. BM-25-scored results are sorted by score
    descending; name-token matches are appended after, unranked.
 
-### `tui`
-`src/tui/mod.rs` is currently an empty stub — not yet implemented.
+### `tui` (`src/tui/`)
+`main.rs` opens `Database` once, clones it for a `std::thread::spawn`ed loop that calls
+`indexer::walk_dirs` every `REINDEX_INTERVAL` (5 minutes) and reports each cycle over an
+`mpsc::Sender<IndexingEvent>` (`Started` / `Finished { errors }`, defined in `index.rs`), then
+calls `tui::run(db, index_rx)` with the original `Database` handle on the main thread. The
+background thread is never joined — `Database`/`Searcher` reads and writes are safe to
+interleave across threads (sled transactions), so the TUI can search while a walk is still in
+progress; process exit just drops the thread, which is fine since sled writes are
+crash-safe. The `IndexingEvent` receiver isn't wired into `App` yet (`run.rs` currently
+ignores it) — surfacing indexing status in the UI is still open.
+
+- `app.rs`: `App` owns the `Database` handle, `query`/`results`/`selected` (for the results
+  list), and the screen/mode state machine. `Screen` is `Home` (landing page) / `Results`
+  (query + list) / `Exit` (a confirmation overlay drawn on top of whichever of the two was
+  active — `App::request_exit` snapshots the current screen into `previous_screen` so
+  cancelling returns to the right place, and resets `exit_choice` to `ExitChoice::No` every
+  time the popup opens so an accidental Enter can't quit). `Action` (`Searching`/`Navigating`,
+  toggled with Tab on the `Results` screen) tracks whether the query box or the results list
+  has focus. `select_next`/`select_previous` wrap around the results list using
+  `checked_add`/`checked_sub` (never raw `+`/`-`, since the crate denies
+  `arithmetic_side_effects`); `set_results` replaces the list and resets `selected` to 0, since
+  the old index may not make sense against a new result set.
+- `run.rs`: owns the crossterm terminal lifecycle (raw mode + alternate screen, restored on
+  the way out) and the blocking key-read loop, with key handling branched per `Screen`. On
+  `Home`, every printable key edits the query (no Tab/Navigating there, since there's nothing
+  to navigate yet) and Enter only transitions to `Results` if the trimmed query is non-empty.
+  On `Results`, Enter re-searches in place. `'q'` only requests the exit confirmation while
+  `Action::Navigating` — while `Searching`, it's just a character, otherwise queries containing
+  the letter "q" would be untypeable; `Esc` is the always-available way to open the exit
+  confirmation from either screen. On the `Exit` screen, Left/Right/Tab toggles which button
+  (`ExitChoice::Yes`/`No`) is highlighted and Enter acts on it; `'y'`/`'n'` remain as direct
+  shortcuts.
+- `ui.rs`: `draw` dispatches on `app.screen`; the `Exit` overlay first redraws whichever screen
+  is in `app.previous_screen` underneath itself, then paints the popup on top via `Clear` + a
+  small fixed-size centered rect (`centered_rect_fixed` — deliberately not
+  percentage-of-parent, so it doesn't balloon on large terminals). `draw_home` renders "SCOUT" as large
+  pixel-art text via the `tui-big-text` crate (`PixelSize::Full`) above a centered search box;
+  `draw_results_screen` renders a small "SCOUT" label pinned top-left next to the search box,
+  the results `List` (with the selected row highlighted only when `Action::Navigating`), and a
+  footer whose help text depends on `Action`. Colors are centralized in `theme.rs` rather than
+  inlined per-widget.
+- `theme.rs`: a small blue-toned palette (`PRIMARY`, `ACCENT`, `TEXT`, `DIM`) plus style helpers
+  (`focused(bool)`, `dim()`, `text()`, `selected()`) — every bordered block/list/popup in
+  `ui.rs` goes through these instead of ad hoc `Style`s, so the look stays consistent.
 
 ## Notes for future work
 

@@ -2,7 +2,7 @@ use std::{collections::HashSet, sync::mpsc, thread};
 
 use anyhow::Result;
 
-use crate::{config::Config, database::Database, search::Searcher, tui::IndexingEvent};
+use crate::{config::Config, database::Database, tui::IndexingEvent};
 
 mod config;
 mod database;
@@ -40,7 +40,7 @@ fn main() -> Result<()> {
         }
     });
 
-    tui::run(db, rx)?;
+    tui::run(db, &rx)?;
 
     Ok(())
 }

@@ -3,16 +3,41 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use tui_big_text::{BigText, PixelSize};
 
 use crate::tui::{
-    app::{Action, App, ExitChoice, Screen},
-    theme,
+    app::{Action, App, ExitChoice, IndexStatus, Screen},
+    format, theme,
 };
 
-pub fn draw(frame: &mut Frame, app: &App) {
+// Text + style for the current `IndexStatus`, shared by the Home and Results footers so both
+// screens describe the background walk the same way.
+fn index_status_text(status: IndexStatus) -> (String, Style) {
+    match status {
+        IndexStatus::Pending => (
+            "Indexación: pendiente".to_string(),
+            Style::default().fg(theme::DIM),
+        ),
+        IndexStatus::Indexing => (
+            "Indexando…".to_string(),
+            Style::default()
+                .fg(theme::PRIMARY)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        IndexStatus::Done { errors: 0 } => (
+            "Índice actualizado".to_string(),
+            Style::default().fg(theme::SUCCESS),
+        ),
+        IndexStatus::Done { errors } => (
+            format!("Índice actualizado · {errors} errores"),
+            Style::default().fg(theme::WARNING),
+        ),
+    }
+}
+
+pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Home => draw_home(frame, app),
         Screen::Results => draw_results_screen(frame, app),
@@ -31,12 +56,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 // The landing screen: a big "SCOUT" wordmark and a centered search box, Google-style.
 fn draw_home(frame: &mut Frame, app: &App) {
-    let [_, title_area, input_area, hint_area, _] = Layout::default()
+    let [_, title_area, input_area, hint_area, status_area, _] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(20),
             Constraint::Length(8),
             Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
@@ -56,11 +82,16 @@ fn draw_home(frame: &mut Frame, app: &App) {
         .alignment(Alignment::Center)
         .style(theme::dim());
     frame.render_widget(hint, centered_rect(60, 100, hint_area));
+
+    let (status_text, status_style) = index_status_text(app.index_status);
+    let status =
+        Paragraph::new(Span::styled(status_text, status_style)).alignment(Alignment::Center);
+    frame.render_widget(status, centered_rect(60, 100, status_area));
 }
 
 // The results screen: "SCOUT" pinned top-left, search box top-right, results list below, and
 // the same navigation footer as before.
-fn draw_results_screen(frame: &mut Frame, app: &App) {
+fn draw_results_screen(frame: &mut Frame, app: &mut App) {
     let [top_area, results_area, footer_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -112,13 +143,17 @@ fn draw_input_box(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
-fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = matches!(app.action, Action::Navigating);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!("Resultados ({})", app.results.len()))
         .border_style(theme::focused(focused));
+
+    // Recorded on every draw (not just when non-empty) so a click while there are no results
+    // reliably misses rather than hit-testing against a stale area from a previous search.
+    app.results_area = Some(area);
 
     if app.results.is_empty() {
         let message = if app.query.is_empty() {
@@ -142,12 +177,29 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
                 .file_name()
                 .map_or_else(|| metadata.path.to_string_lossy(), |n| n.to_string_lossy());
             let path = metadata.path.to_string_lossy();
+            let kind = format::kind_label(metadata.kind);
+            let extension = format::extension(&metadata.path);
+            let details = format!(
+                "  ·  Extension: {}  ·  Tamaño: {}  ·  modificado: {}",
+                extension.as_deref().unwrap_or("sin extensión"),
+                format::size(metadata.size),
+                format::modified(metadata.modified),
+            );
 
-            ListItem::new(Line::from(vec![
-                Span::styled(name.into_owned(), theme::text()),
-                Span::raw("  "),
-                Span::styled(path.into_owned(), theme::dim()),
-            ]))
+            ListItem::new(vec![
+                Line::from(Span::styled(name.into_owned(), theme::text())),
+                Line::from(Span::styled(path.into_owned(), theme::dim())),
+                Line::from(vec![
+                    Span::styled(
+                        format!("Tipo: {kind}"),
+                        Style::default()
+                            .fg(theme::kind_color(metadata.kind))
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                    Span::styled(details, theme::dim()),
+                ]),
+                // Line::raw(""),
+            ])
         })
         .collect();
 
@@ -155,12 +207,10 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         .block(block)
         .highlight_style(theme::selected());
 
-    let mut state = ListState::default();
-    if focused {
-        state.select(Some(app.selected));
-    }
+    app.results_list_state
+        .select(focused.then_some(app.selected));
 
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, area, &mut app.results_list_state);
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -169,9 +219,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Action::Navigating => "↑/↓: mover selección · Tab: volver a buscar · q/Esc: salir",
     };
 
+    let (status_text, status_style) = index_status_text(app.index_status);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Ayuda")
+        .title_top(Line::from(Span::styled(status_text, status_style)).right_aligned())
         .border_style(theme::dim());
 
     frame.render_widget(
@@ -210,8 +263,8 @@ fn draw_exit_popup(frame: &mut Frame, app: &App) {
     );
 
     let (yes_style, no_style) = match app.exit_choice {
-        ExitChoice::Yes => (theme::selected(), theme::dim()),
-        ExitChoice::No => (theme::dim(), theme::selected()),
+        ExitChoice::Yes => (theme::confirm(), theme::dim()),
+        ExitChoice::No => (theme::dim(), theme::safe()),
     };
     let buttons = Line::from(vec![
         Span::styled("  Sí  ", yes_style),

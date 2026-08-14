@@ -1,5 +1,7 @@
 mod app;
+mod format;
 mod index;
+mod opener;
 mod run;
 mod theme;
 mod ui;

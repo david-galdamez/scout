@@ -1,4 +1,14 @@
-use crate::database::{Database, Metadata};
+use ratatui::{layout::Rect, widgets::ListState};
+
+use crate::{
+    database::{Database, Metadata},
+    tui::IndexingEvent,
+};
+
+// Lines rendered per result row in `ui::draw_results` (file name, path, details) — kept here
+// rather than derived, since `App::result_index_at` needs it to map a click's row back to a
+// result index and has no access to the `ListItem`s built at render time.
+const RESULT_ITEM_HEIGHT: usize = 3;
 
 #[derive(Debug)]
 pub enum Action {
@@ -14,6 +24,16 @@ pub enum Screen {
     Home,
     Results,
     Exit,
+}
+
+// The status of the index, which is used to determine what to display in the UI. Starts
+// `Pending` (no walk has reported in yet) rather than `Done`, since the background thread's
+// first `Started` event may not have arrived before the first frame is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexStatus {
+    Pending,
+    Indexing,
+    Done { errors: usize },
 }
 
 // Which button is highlighted in the exit confirmation popup.
@@ -35,10 +55,16 @@ pub struct App {
     pub previous_screen: Screen,
     pub exit_choice: ExitChoice,
     pub action: Action,
+    pub index_status: IndexStatus,
+    // The screen-space rect the results `List` was last rendered into, and the `ListState`
+    // used for that render (which `render_stateful_widget` mutates to track scroll offset) —
+    // together these let a mouse click be translated back into a result index.
+    pub results_area: Option<Rect>,
+    pub results_list_state: ListState,
 }
 
 impl App {
-    pub const fn new(db: Database) -> Self {
+    pub fn new(db: Database) -> Self {
         Self {
             db,
             query: String::new(),
@@ -49,7 +75,40 @@ impl App {
             previous_screen: Screen::Home,
             exit_choice: ExitChoice::No,
             action: Action::Searching,
+            index_status: IndexStatus::Pending,
+            results_area: None,
+            results_list_state: ListState::default(),
         }
+    }
+
+    // Translates a mouse click's screen row into a result index, using the `List`'s
+    // last-rendered area and scroll offset. Returns `None` for clicks outside the list's
+    // content rows (borders, empty space below the last item) or past the end of `results`.
+    pub fn result_index_at(&self, column: u16, row: u16) -> Option<usize> {
+        let area = self.results_area?;
+        if column < area.x || column >= area.x.saturating_add(area.width) {
+            return None;
+        }
+
+        // -1 for the top border.
+        let content_row = row.checked_sub(area.y)?.checked_sub(1)?;
+        // -2 for the top and bottom borders.
+        if content_row >= area.height.saturating_sub(2) {
+            return None;
+        }
+
+        let row_in_view = usize::from(content_row).checked_div(RESULT_ITEM_HEIGHT)?;
+        let index = self.results_list_state.offset().checked_add(row_in_view)?;
+        (index < self.results.len()).then_some(index)
+    }
+
+    pub fn on_indexing_event(&mut self, event: IndexingEvent) {
+        self.index_status = match event {
+            IndexingEvent::Started => IndexStatus::Indexing,
+            IndexingEvent::Finished { errors } => IndexStatus::Done {
+                errors: errors.len(),
+            },
+        };
     }
 
     pub const fn toggle_action(&mut self) {

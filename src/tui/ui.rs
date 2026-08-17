@@ -85,9 +85,19 @@ fn draw_home(frame: &mut Frame, app: &App) {
 
     draw_input_box(frame, app, centered_rect(60, 100, input_area), true);
 
-    let hint = Paragraph::new("Enter: search · F1: settings · F2: errors · Esc: quit")
-        .alignment(Alignment::Center)
-        .style(theme::dim());
+    // A pending error takes over the hint line entirely — it's the more urgent thing to read —
+    // rather than being squeezed in alongside it.
+    let hint = app
+        .last_error
+        .as_deref()
+        .map_or_else(
+            || {
+                Paragraph::new("Enter: search · F1: settings · F2: errors · Esc: quit")
+                    .style(theme::dim())
+            },
+            |error| Paragraph::new(error.to_string()).style(theme::error()),
+        )
+        .alignment(Alignment::Center);
     frame.render_widget(hint, centered_rect(60, 100, hint_area));
 
     let (status_text, status_style) = index_status_text(app.index_status);
@@ -238,10 +248,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         .title_top(Line::from(Span::styled(status_text, status_style)).right_aligned())
         .border_style(theme::dim());
 
-    frame.render_widget(
-        Paragraph::new(Span::styled(help, theme::dim())).block(block),
-        area,
+    // A pending error takes over the help line entirely — it's the more urgent thing to read —
+    // rather than being squeezed in alongside it.
+    let line = app.last_error.as_deref().map_or_else(
+        || Span::styled(help, theme::dim()),
+        |error| Span::styled(error.to_string(), theme::error()),
     );
+
+    frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
 fn draw_exit_popup(frame: &mut Frame, app: &App) {

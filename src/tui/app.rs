@@ -351,6 +351,7 @@ pub struct App {
     pub exit_choice: ExitChoice,
     pub action: Action,
     pub index_status: IndexStatus,
+    pub last_error: Option<String>,
     // The screen-space rect the results `List` was last rendered into, and the `ListState`
     // used for that render (which `render_stateful_widget` mutates to track scroll offset) —
     // together these let a mouse click be translated back into a result index.
@@ -381,6 +382,7 @@ impl App {
             exit_choice: ExitChoice::No,
             action: Action::Searching,
             index_status: IndexStatus::Pending,
+            last_error: None,
             results_area: None,
             results_list_state: ListState::default(),
             config,
@@ -546,5 +548,13 @@ impl App {
             .selected
             .checked_sub(1)
             .unwrap_or_else(|| self.results.len().saturating_sub(1));
+    }
+
+    pub fn set_last_error(&mut self, error: impl Into<String>) {
+        self.last_error = Some(error.into());
+    }
+
+    pub fn clear_last_error(&mut self) {
+        self.last_error = None;
     }
 }

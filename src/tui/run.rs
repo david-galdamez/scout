@@ -19,13 +19,13 @@ use ratatui::{
 use thiserror::Error;
 
 use crate::{
-    config::{Config, ConfigError},
+    config::Config,
     database::Database,
-    search::{self, Searcher},
+    search::Searcher,
     tui::{
         ConfigUpdate, IndexingEvent,
         app::{Action, App, ConfigFocus, ExitChoice, Screen},
-        opener::reveal_document,
+        opener::{describe_open_error, reveal_document},
         ui::draw,
     },
 };
@@ -34,12 +34,6 @@ use crate::{
 pub enum TuiErrors {
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
-    #[error("Search error: {0}")]
-    SearchError(#[from] search::SearchError),
-    #[error("Error opening file explorer: {0}")]
-    OpenError(#[from] opener::OpenError),
-    #[error("Error saving config: {0}")]
-    ConfigError(#[from] ConfigError),
 }
 
 pub fn run(
@@ -56,7 +50,7 @@ pub fn run(
 
     let mut app = App::new(db, config, config_tx);
 
-    run_app(&mut terminal, &mut app, index_rx)?;
+    let result = run_app(&mut terminal, &mut app, index_rx);
 
     disable_raw_mode()?;
     execute!(
@@ -65,6 +59,8 @@ pub fn run(
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
+
+    result?;
 
     Ok(())
 }
@@ -86,6 +82,7 @@ where
         terminal.draw(|f| draw(f, app))?;
 
         while let Ok(event) = index_rx.try_recv() {
+            app.clear_last_error();
             app.on_indexing_event(event);
         }
 
@@ -105,8 +102,10 @@ where
                 // "select via click" gesture, since Up/Down + Enter already cover that.
                 if let Some(index) = app.result_index_at(mouse.column, mouse.row) {
                     app.selected = index;
-                    if let Some(selected) = app.results.get(app.selected) {
-                        reveal_document(selected.path.as_path())?;
+                    if let Some(selected) = app.results.get(app.selected)
+                        && let Err(e) = reveal_document(selected.path.as_path())
+                    {
+                        app.set_last_error(describe_open_error(&selected.path, &e));
                     }
                 }
             }
@@ -116,10 +115,10 @@ where
                 }
 
                 match app.screen {
-                    Screen::Home => handle_home_key(app, key.code)?,
-                    Screen::Results => handle_results_key(app, key.code)?,
+                    Screen::Home => handle_home_key(app, key.code),
+                    Screen::Results => handle_results_key(app, key.code),
                     Screen::Exit => handle_exit_key(app, key.code),
-                    Screen::Config => handle_config_key(app, key.code)?,
+                    Screen::Config => handle_config_key(app, key.code),
                     Screen::Errors => handle_errors_key(app, key.code),
                 }
             }
@@ -131,7 +130,7 @@ where
 
 // The landing screen is just a query box — no results yet to navigate, so every printable key
 // edits the query and 'q' is a plain character, not quit.
-fn handle_home_key(app: &mut App, code: KeyCode) -> Result<(), TuiErrors> {
+fn handle_home_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc => app.request_exit(),
         KeyCode::F(1) => app.open_config(),
@@ -140,8 +139,16 @@ fn handle_home_key(app: &mut App, code: KeyCode) -> Result<(), TuiErrors> {
             app.query.pop();
         }
         KeyCode::Enter if !app.query.trim().is_empty() => {
-            let results = Searcher::new(&app.db).search(&app.query)?;
-            app.set_results(results);
+            let results = Searcher::new(&app.db).search(&app.query);
+            match results {
+                Ok(res) => {
+                    app.set_results(res);
+                }
+                Err(e) => {
+                    app.clear_last_error();
+                    app.set_last_error(e.to_string());
+                }
+            }
             app.screen = Screen::Results;
         }
         KeyCode::Char(value) => {
@@ -149,10 +156,9 @@ fn handle_home_key(app: &mut App, code: KeyCode) -> Result<(), TuiErrors> {
         }
         _ => {}
     }
-    Ok(())
 }
 
-fn handle_results_key(app: &mut App, code: KeyCode) -> Result<(), TuiErrors> {
+fn handle_results_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc => app.request_exit(),
         KeyCode::F(1) => app.open_config(),
@@ -184,18 +190,27 @@ fn handle_results_key(app: &mut App, code: KeyCode) -> Result<(), TuiErrors> {
         }
         KeyCode::Enter => match app.action {
             Action::Searching => {
-                let results = Searcher::new(&app.db).search(&app.query)?;
-                app.set_results(results);
+                let results = Searcher::new(&app.db).search(&app.query);
+                match results {
+                    Ok(res) => {
+                        app.set_results(res);
+                    }
+                    Err(e) => {
+                        app.clear_last_error();
+                        app.set_last_error(e.to_string());
+                    }
+                }
             }
             Action::Navigating => {
-                if let Some(selected) = app.results.get(app.selected) {
-                    reveal_document(selected.path.as_path())?;
+                if let Some(selected) = app.results.get(app.selected)
+                    && let Err(e) = reveal_document(selected.path.as_path())
+                {
+                    app.set_last_error(describe_open_error(&selected.path, &e));
                 }
             }
         },
         _ => {}
     }
-    Ok(())
 }
 
 const fn handle_exit_key(app: &mut App, code: KeyCode) {
@@ -213,15 +228,20 @@ const fn handle_exit_key(app: &mut App, code: KeyCode) {
 
 // `config_draft` is always `Some` while `Screen::Config` is active — set by `App::open_config`
 // and only cleared by leaving it (`cancel_config`/`save_config`).
-fn handle_config_key(app: &mut App, code: KeyCode) -> Result<(), TuiErrors> {
+fn handle_config_key(app: &mut App, code: KeyCode) {
     let Some(draft) = app.config_draft.as_mut() else {
-        return Ok(());
+        return;
     };
 
     match draft.focus {
         ConfigFocus::List(_) => match code {
             KeyCode::Esc => app.cancel_config(),
-            KeyCode::Char('s') => app.save_config()?,
+            KeyCode::Char('s') => {
+                if let Err(e) = app.save_config() {
+                    app.clear_last_error();
+                    app.set_last_error(e.to_string());
+                }
+            }
             KeyCode::Tab => draft.toggle_list(),
             KeyCode::Up => draft.select_previous(),
             KeyCode::Down => draft.select_next(),
@@ -239,8 +259,6 @@ fn handle_config_key(app: &mut App, code: KeyCode) -> Result<(), TuiErrors> {
             _ => {}
         },
     }
-
-    Ok(())
 }
 
 fn handle_errors_key(app: &mut App, code: KeyCode) {

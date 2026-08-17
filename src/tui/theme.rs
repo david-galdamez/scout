@@ -26,6 +26,12 @@ pub fn text() -> Style {
     Style::default().fg(TEXT)
 }
 
+// A failed action (search, open, config save) reported in a footer/hint line — reuses the same
+// red as the exit popup's destructive "Yes" button so danger reads consistently across the UI.
+pub fn error() -> Style {
+    Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+}
+
 pub fn selected() -> Style {
     Style::default()
         .fg(Color::White)

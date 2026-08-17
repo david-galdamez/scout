@@ -198,7 +198,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
                 Line::from(Span::styled(path.into_owned(), theme::dim())),
                 Line::from(vec![
                     Span::styled(
-                        format!("Tipo: {kind}"),
+                        format!("Kind: {kind}"),
                         Style::default()
                             .fg(theme::kind_color(metadata.kind))
                             .add_modifier(ratatui::style::Modifier::BOLD),

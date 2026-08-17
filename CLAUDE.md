@@ -121,12 +121,42 @@ returns every key currently in the `file_ids` tree, as raw `IVec`s, for the walk
 against what it saw.
 
 ### `indexer` (`src/indexer/`)
-- `file_walker.rs`: `walk_dirs` uses `walkdir::WalkDir` per configured include directory,
-  filtering out excluded directory names, and returns a `Vec<(PathBuf, DirErrors)>` of
-  per-file/per-dir errors rather than failing the whole run (permission errors, symlink
-  loops, I/O errors, and per-file indexing errors are all collected, not fatal). Before
-  indexing, `index_state` classifies each file as `New`, `Unchanged`, or `Modified`, primarily
-  by computing the file's `util::file_id` and looking it up via
+- `file_walker.rs`: `walk_dirs` walks each configured include directory with
+  `ignore::WalkBuilder`/`WalkParallel` (the engine behind ripgrep/fd) rather than a
+  single-threaded walk — it spreads traversal, classification, and indexing across a thread
+  pool sized to the machine's core count (`WalkBuilder`'s own default, roughly
+  `available_parallelism().min(12)`), and it's `.gitignore`/`.ignore`-aware, so a project's own
+  ignore rules prune dependency/build directories automatically. `.gitignore` respect only
+  activates inside an actual git repo (`require_git`, on by default, left untouched) — a
+  `.gitignore`-named file with no `.git` anywhere at/above it is not treated specially, which
+  is fine for the common case: the configured include directory itself (e.g. `~/Dev`) usually
+  isn't a repo, but the individual projects nested under it are, and each one's own
+  `.gitignore` applies once the walk descends into it. `.parents(false)` and `.git_global(false)`
+  are set explicitly so only ignore files *inside* the walked tree apply — not a `.gitignore`
+  sitting above the include directory, nor the user's global git excludesFile, either of which
+  would otherwise reach in and hide files the user explicitly configured to be indexed.
+  `.hidden(false)` is set explicitly too, since `ignore`'s default is to skip dotfiles and the
+  previous engine (`walkdir`) had no such behavior — dotfiles are still indexed unless excluded
+  by name, same as before. The configured `exclude: &HashSet<String>` set is layered on top via
+  `filter_entry` as an additional, explicit prune (unchanged config semantics from before this
+  rewrite).
+
+  `errors: Mutex<Vec<(PathBuf, DirErrors)>>` and `visited_file_ids: Mutex<HashSet<IVec>>` are
+  shared across every worker thread the walk spawns (`ignore::WalkParallel::run` uses
+  `std::thread::scope` internally, so plain `&Mutex<_>` references work — no `Arc` needed, since
+  the call is synchronous and every worker has joined by the time `run` returns). `Database` is
+  passed by `&Database` into the per-thread visitor closures for the same reason; it's already
+  cheap to clone/share across threads elsewhere in this codebase (`main.rs`'s background
+  indexing thread and the TUI both hold their own clone). A small `recover` helper unwraps a
+  `Mutex`'s value even from a poisoned lock (`PoisonError::into_inner`) rather than panicking,
+  since nothing in these critical sections does anything this crate's lint set would let panic.
+  `ignore::Error`'s path/loop-ancestor info can be nested behind `WithPath`/`WithDepth`/
+  `WithLineNumber` wrapper variants — `error_path`/`loop_ancestor` walk down through them to
+  find it, replacing the dedicated `.path()`/`.loop_ancestor()` methods `walkdir::Error` used to
+  offer directly.
+
+  Before indexing, `index_state` classifies each file as `New`, `Unchanged`, or `Modified`,
+  primarily by computing the file's `util::file_id` and looking it up via
   `Database::get_doc_id_by_file_id`: no match is `New`; a match is `Unchanged` only if both
   the stored path and mtime match the file's current path/mtime, otherwise `Modified` — so a
   bare rename (same content, new path) is classified the same way as a content edit, rather
@@ -134,15 +164,16 @@ against what it saw.
   `get_file_modified_time`, blind to renames) when the platform can't provide a `file_id`.
   `New` files go through `index_file` (classify -> process_*), and `Modified` files go through
   `reindex_file` (classify -> process_and_reindex_*). `index_state` also records every file's
-  `FileId` (as raw bytes) into a `visited_file_ids` set threaded through the whole walk. Once
-  every configured directory has been walked, `walk_dirs` diffs that set against
-  `Database::get_all_file_ids` (via `FileId::from_bytes`, which returns `None` — skipped rather
-  than erroring — for a key of the wrong length) and calls `prune_stale_file` for every indexed
-  `file_id` that wasn't visited: it looks up the doc's old `Metadata` to normalize its file name,
-  then calls `db.delete_document`, no-oping rather than erroring if the id or doc has already
-  vanished (e.g. a race with another prune). This is how deletes and moves-out-of-scope get
-  reflected in the index — a file whose `file_id` is never seen again during a walk is treated
-  as gone.
+  `FileId` (as raw bytes) into the shared `visited_file_ids` set, taking the lock only for that
+  one insert rather than for the sled reads around it, to keep worker threads off each other's
+  toes as much as possible. Once every configured directory has been walked, `walk_dirs` diffs
+  that set against `Database::get_all_file_ids` (via `FileId::from_bytes`, which returns `None`
+  — skipped rather than erroring — for a key of the wrong length) and calls `prune_stale_file`
+  for every indexed `file_id` that wasn't visited: it looks up the doc's old `Metadata` to
+  normalize its file name, then calls `db.delete_document`, no-oping rather than erroring if the
+  id or doc has already vanished (e.g. a race with another prune). This is how deletes and
+  moves-out-of-scope get reflected in the index — a file whose `file_id` is never seen again
+  during a walk is treated as gone.
 - `classifier.rs` / `extension_map.rs`: classifies a path as `Text`/`Image`/`Binary`, first
   by extension lookup (`EXTENSION_MAP`), falling back to content sniffing via
   `content_inspector::inspect` on the first 8KB when the extension is unknown.
@@ -309,6 +340,16 @@ since sled writes are crash-safe.
   "open with the default app" alternative (e.g. a modifier-click or a second shortcut), which
   would need a second `opener` call (`opener::open`) and a key/mouse-gesture decision for how
   the two should coexist.
+- `walk_dirs`'s parallel workers all write through the same `stats` tree
+  (`Database::bump_stats`/`decrease_stat` in `src/database/repository.rs`, touched by every
+  `index_document`/`reindex_text_document`/etc. transaction), which is a read-then-write on a
+  handful of shared keys (`n_text_docs`, `n_terms`, …). sled retries a transaction on conflict
+  rather than corrupting anything, so this doesn't threaten correctness, but it's a real
+  serialization point — expect indexing throughput to scale with worker count for the
+  walk/classify/tokenize/read-file work, then taper off on the final commit step. Not worth
+  fixing preemptively (e.g. by accumulating stats deltas per-thread and merging once at the
+  end) without a measurement showing it's the actual bottleneck — it would add real complexity
+  to code that currently guarantees per-document atomicity.
 - The config screen's `Include` autocomplete only completes to a full existing subdirectory
   (`ConfigDraft::update_suggestions` filters `std::fs::read_dir` results) — there's no way to
   type a path that doesn't exist yet and have it accepted as a not-yet-created directory, nor

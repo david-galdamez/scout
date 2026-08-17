@@ -1,11 +1,12 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::{LockResult, Mutex, PoisonError},
 };
 
+use ignore::{DirEntry, WalkBuilder, WalkState};
 use sled::IVec;
 use thiserror::Error;
-use walkdir::WalkDir;
 
 use crate::{
     database::{Database, FileType},
@@ -46,80 +47,100 @@ enum IndexState {
     Modified,
 }
 
-// Walks through the provided directories, classifies files, and processes them accordingly. Returns a vector of errors encountered during the walk.
+// Recovers a `Mutex`'s value even if some other thread panicked while holding it, rather than
+// propagating that panic here. None of the critical sections in this file do anything that
+// this crate's lint set would let panic (no raw arithmetic, no unwraps, no indexing) — a
+// poisoned lock could only come from something outside our control, and losing the whole
+// walk's progress over that would be worse than continuing with the guarded data as-is.
+fn recover<T>(result: LockResult<T>) -> T {
+    result.unwrap_or_else(PoisonError::into_inner)
+}
+
+// Leaves one core free for the TUI's own thread rather than handing every core to the walk
+// (`WalkBuilder`'s own default when `.threads(0)`). This app runs the walk on a 5-minute
+// timer in the background while the user is actively typing/searching, so saturating every
+// core makes the OS scheduler starve the single UI thread of time slices — felt as the whole
+// app freezing mid-keystroke, even though typing itself never touches the database. Floors at
+// 1 so a single-core machine still gets a (shared) worker thread instead of none.
+fn worker_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .saturating_sub(1)
+        .max(1)
+}
+
+// Walks through the provided directories, classifies files, and processes them accordingly.
+// Returns a vector of errors encountered during the walk.
+//
+// Each `dir` is walked with `ignore::WalkBuilder`/`WalkParallel` (the engine behind
+// ripgrep/fd) rather than a plain single-threaded walk: it spreads traversal, classification,
+// and indexing across a thread pool sized to the machine's core count, and it's
+// `.gitignore`/`.ignore`-aware, so a project's own ignore rules prune dependency/build
+// directories automatically instead of relying solely on the hand-maintained `exclude` list.
+// `exclude` is layered on top via `filter_entry` as an explicit, additional prune — config
+// semantics for it are unchanged from before.
 pub fn walk_dirs(
     dirs: &Vec<PathBuf>,
     exclude: &HashSet<String>,
     db: &Database,
 ) -> Vec<(PathBuf, DirErrors)> {
-    let mut errors = Vec::new();
-    let mut visited_file_ids: HashSet<IVec> = HashSet::new();
+    let errors: Mutex<Vec<(PathBuf, DirErrors)>> = Mutex::new(Vec::new());
+    let visited_file_ids: Mutex<HashSet<IVec>> = Mutex::new(HashSet::new());
 
     for dir in dirs {
         if let Err(e) = validate_dir(dir) {
-            errors.push((dir.clone(), e));
+            recover(errors.lock()).push((dir.clone(), e));
             continue;
         }
 
-        for entry in WalkDir::new(dir)
-            .into_iter()
-            .filter_entry(|e| !exclude.contains(e.file_name().to_str().unwrap_or("")))
-        {
-            match entry {
-                Ok(entry) => {
-                    if entry.file_type().is_file() {
-                        match index_state(entry.path(), db, &mut visited_file_ids) {
-                            Ok(IndexState::Unchanged) => {}
-                            Ok(IndexState::New) => {
-                                if let Err(e) = index_file(entry.path(), db) {
-                                    errors.push((entry.path().to_path_buf(), e));
-                                }
-                            }
-                            Ok(IndexState::Modified) => {
-                                if let Err(e) = reindex_file(entry.path(), db) {
-                                    errors.push((entry.path().to_path_buf(), e));
-                                }
-                            }
-                            Err(e) => errors.push((entry.path().to_path_buf(), e)),
+        let exclude = exclude.clone();
+        let mut builder = WalkBuilder::new(dir);
+        builder
+            .threads(worker_thread_count())
+            .filter_entry(move |entry| !exclude.contains(entry.file_name().to_str().unwrap_or("")))
+            // Only `.gitignore`/`.ignore` files *inside* the walked tree apply — one sitting
+            // above `dir` (e.g. in the user's home directory) shouldn't reach in and hide
+            // files the user explicitly configured to be indexed.
+            .parents(false)
+            // The previous engine (`walkdir`) had no notion of "hidden", so dotfiles were
+            // indexed unless excluded by name — keep that behavior rather than silently
+            // dropping every dotfile now that `ignore`'s default is to skip them.
+            .hidden(false)
+            // Same reasoning as `parents`: the user's global git excludesFile is unrelated to
+            // this app and lives outside the walked tree, so don't let it affect what's
+            // indexed.
+            .git_global(false);
+        // `.gitignore` respect (`git_ignore`, on by default) only activates inside an actual
+        // git repository — `require_git` (also on by default, left as-is here) means a
+        // `.gitignore`-named file with no `.git` anywhere at/above it is not treated
+        // specially. That's fine for the common case this is meant to solve: `dir` itself
+        // (e.g. `~/Dev`) usually isn't a repo, but the individual projects nested under it
+        // are, and each one's own `.gitignore` still applies once the walk descends into it.
+
+        builder.build_parallel().run(|| {
+            Box::new(|entry_result: Result<DirEntry, ignore::Error>| {
+                match entry_result {
+                    Ok(entry) => {
+                        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                            visit_file(entry.path(), db, &errors, &visited_file_ids);
                         }
                     }
+                    Err(err) => record_walk_error(&errors, err),
                 }
-                Err(e) => {
-                    let path = e
-                        .path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-
-                    let loop_path = e
-                        .loop_ancestor()
-                        .unwrap_or_else(|| Path::new(""))
-                        .to_path_buf();
-
-                    match e.into_io_error() {
-                        Some(inner) if inner.kind() == std::io::ErrorKind::PermissionDenied => {
-                            errors.push((PathBuf::from(&path), DirErrors::PermissionDenied));
-                        }
-                        Some(inner) => {
-                            errors
-                                .push((Path::new(&path).to_path_buf(), DirErrors::IoError(inner)));
-                        }
-                        None => {
-                            errors.push((loop_path, DirErrors::SymlinkLoop));
-                        }
-                    }
-                }
-            }
-        }
+                WalkState::Continue
+            })
+        });
     }
 
     let file_ids = match db.get_all_file_ids() {
         Ok(ids) => ids,
         Err(e) => {
-            errors.push((PathBuf::new(), DirErrors::DatabaseError(e)));
-            return errors;
+            recover(errors.lock()).push((PathBuf::new(), DirErrors::DatabaseError(e)));
+            return recover(errors.into_inner());
         }
     };
 
+    let visited_file_ids = recover(visited_file_ids.into_inner());
     for raw_id in file_ids {
         if visited_file_ids.contains(&raw_id) {
             continue;
@@ -132,11 +153,87 @@ pub fn walk_dirs(
         };
 
         if let Err(e) = prune_stale_file(db, id) {
-            errors.push((PathBuf::new(), e));
+            recover(errors.lock()).push((PathBuf::new(), e));
         }
     }
 
-    errors
+    recover(errors.into_inner())
+}
+
+// Classifies and indexes/reindexes a single file, recording any failure into `errors` rather
+// than stopping the walk. Called concurrently, once per file, from every worker thread.
+fn visit_file(
+    path: &Path,
+    db: &Database,
+    errors: &Mutex<Vec<(PathBuf, DirErrors)>>,
+    visited_file_ids: &Mutex<HashSet<IVec>>,
+) {
+    match index_state(path, db, visited_file_ids) {
+        Ok(IndexState::Unchanged) => {}
+        Ok(IndexState::New) => {
+            if let Err(e) = index_file(path, db) {
+                recover(errors.lock()).push((path.to_path_buf(), e));
+            }
+        }
+        Ok(IndexState::Modified) => {
+            if let Err(e) = reindex_file(path, db) {
+                recover(errors.lock()).push((path.to_path_buf(), e));
+            }
+        }
+        Err(e) => recover(errors.lock()).push((path.to_path_buf(), e)),
+    }
+}
+
+// Converts a directory/file-level error surfaced by the walk itself (permission denial,
+// symlink loop, generic I/O failure) into a `DirErrors` and records it.
+fn record_walk_error(errors: &Mutex<Vec<(PathBuf, DirErrors)>>, error: ignore::Error) {
+    if let Some(ancestor) = loop_ancestor(&error) {
+        let ancestor = ancestor.to_path_buf();
+        recover(errors.lock()).push((ancestor, DirErrors::SymlinkLoop));
+        return;
+    }
+
+    let path = error_path(&error).map_or_else(PathBuf::new, Path::to_path_buf);
+    // Computed before `into_io_error()` consumes `error`, for the fallback branch below.
+    let message = error.to_string();
+
+    match error.into_io_error() {
+        Some(inner) if inner.kind() == std::io::ErrorKind::PermissionDenied => {
+            recover(errors.lock()).push((path, DirErrors::PermissionDenied));
+        }
+        Some(inner) => recover(errors.lock()).push((path, DirErrors::IoError(inner))),
+        None => {
+            // A non-I/O `ignore::Error` (e.g. a malformed `.gitignore` line) — nothing in
+            // `DirErrors` models this specifically, so carry its message through as a
+            // synthetic I/O error rather than adding a variant for a case this app never
+            // triggers deliberately (we don't configure globs/type overrides).
+            recover(errors.lock()).push((path, DirErrors::IoError(std::io::Error::other(message))));
+        }
+    }
+}
+
+// `ignore::Error`'s path/loop-ancestor info can be nested a few layers deep (e.g. `WithDepth`
+// wrapping the actual `WithPath`/`Loop`) — these walk down through the wrapper variants to
+// find it, mirroring how `walkdir::Error` exposed the same information through dedicated
+// `.path()`/`.loop_ancestor()` methods.
+fn error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path.as_path()),
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            error_path(err)
+        }
+        _ => None,
+    }
+}
+
+fn loop_ancestor(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::Loop { ancestor, .. } => Some(ancestor.as_path()),
+        ignore::Error::WithPath { err, .. }
+        | ignore::Error::WithLineNumber { err, .. }
+        | ignore::Error::WithDepth { err, .. } => loop_ancestor(err),
+        _ => None,
+    }
 }
 
 // Removes the doc indexed under `id` when the file it points to wasn't seen during this walk
@@ -210,13 +307,13 @@ fn reindex_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
 fn index_state(
     path: &Path,
     db: &Database,
-    file_ids: &mut HashSet<IVec>,
+    visited_file_ids: &Mutex<HashSet<IVec>>,
 ) -> Result<IndexState, DirErrors> {
     let fs_metadata = std::fs::metadata(path)?;
     let current_modified = modified_secs(&fs_metadata);
 
     if let Some(id) = file_id(&fs_metadata) {
-        file_ids.insert(IVec::from(id.to_bytes().to_vec()));
+        recover(visited_file_ids.lock()).insert(IVec::from(id.to_bytes().to_vec()));
         return Ok(match db.get_doc_id_by_file_id(id)? {
             None => IndexState::New,
             Some(doc_id) => match db.get_metadata(doc_id)? {
@@ -236,4 +333,113 @@ fn index_state(
         Some(recorded_modified) if current_modified > recorded_modified => IndexState::Modified,
         Some(_) => IndexState::Unchanged,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::database::Database;
+
+    fn open_db() -> (TempDir, Database) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db = Database::new(dir.path()).expect("failed to open database");
+        (dir, db)
+    }
+
+    #[test]
+    fn respects_gitignore_inside_the_walked_tree() {
+        let (_db_dir, db) = open_db();
+        let tree = tempfile::tempdir().expect("failed to create temp dir");
+
+        // `ignore` only honors `.gitignore` inside an actual git repo (`require_git` defaults
+        // to `true`) — a bare `.gitignore` with no `.git` marker anywhere at/above it is not
+        // treated specially. A `.git` dir (even an empty one — the walker only checks for its
+        // presence, not that it's a real repo) is what makes this test representative of the
+        // real case: `dir` itself (e.g. `~/Dev`) usually isn't a repo, but the projects nested
+        // under it are.
+        let project = tree.path().join("project");
+        std::fs::create_dir(&project).expect("failed to create dir");
+        std::fs::create_dir(project.join(".git")).expect("failed to create dir");
+        std::fs::write(project.join(".gitignore"), "ignored/\n")
+            .expect("failed to write .gitignore");
+        std::fs::create_dir(project.join("ignored")).expect("failed to create dir");
+        std::fs::write(project.join("ignored").join("skip.txt"), b"skip")
+            .expect("failed to write file");
+        std::fs::write(project.join("keep.txt"), b"keep").expect("failed to write file");
+
+        let errors = walk_dirs(&vec![tree.path().to_path_buf()], &HashSet::new(), &db);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        assert!(
+            db.get_doc_id_by_path(&project.join("keep.txt"))
+                .expect("get_doc_id_by_path failed")
+                .is_some()
+        );
+        assert!(
+            db.get_doc_id_by_path(&project.join("ignored").join("skip.txt"))
+                .expect("get_doc_id_by_path failed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exclude_set_still_prunes_directories_without_gitignore() {
+        let (_db_dir, db) = open_db();
+        let tree = tempfile::tempdir().expect("failed to create temp dir");
+
+        std::fs::create_dir(tree.path().join("node_modules")).expect("failed to create dir");
+        std::fs::write(
+            tree.path().join("node_modules").join("dep.js"),
+            b"module.exports = {}",
+        )
+        .expect("failed to write file");
+        std::fs::write(tree.path().join("keep.txt"), b"keep").expect("failed to write file");
+
+        let exclude = HashSet::from(["node_modules".to_string()]);
+        let errors = walk_dirs(&vec![tree.path().to_path_buf()], &exclude, &db);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        assert!(
+            db.get_doc_id_by_path(&tree.path().join("keep.txt"))
+                .expect("get_doc_id_by_path failed")
+                .is_some()
+        );
+        assert!(
+            db.get_doc_id_by_path(&tree.path().join("node_modules").join("dep.js"))
+                .expect("get_doc_id_by_path failed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_walk_indexes_every_file_exactly_once_and_is_idempotent() {
+        const FILE_COUNT: usize = 64;
+
+        let (_db_dir, db) = open_db();
+        let tree = tempfile::tempdir().expect("failed to create temp dir");
+
+        for i in 0..FILE_COUNT {
+            let sub = tree.path().join(format!("dir_{i}"));
+            std::fs::create_dir(&sub).expect("failed to create dir");
+            std::fs::write(sub.join("file.txt"), format!("content {i}"))
+                .expect("failed to write file");
+        }
+
+        let dirs = vec![tree.path().to_path_buf()];
+        let errors = walk_dirs(&dirs, &HashSet::new(), &db);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        let file_ids = db.get_all_file_ids().expect("get_all_file_ids failed");
+        assert_eq!(file_ids.len(), FILE_COUNT);
+
+        // A second, unchanged walk must not create duplicate docs or errors — every file
+        // should resolve to `IndexState::Unchanged` regardless of which worker thread reaches
+        // it first.
+        let errors = walk_dirs(&dirs, &HashSet::new(), &db);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let file_ids_after = db.get_all_file_ids().expect("get_all_file_ids failed");
+        assert_eq!(file_ids_after.len(), FILE_COUNT);
+    }
 }

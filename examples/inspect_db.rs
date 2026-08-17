@@ -14,8 +14,31 @@ fn main() -> anyhow::Result<()> {
     print_json_tree(&db, "metadata")?;
     print_json_tree(&db, "file_names")?;
     print_json_tree(&db, "terms")?;
+    print_file_ids_tree(&db)?;
     print_stats_tree(&db)?;
 
+    Ok(())
+}
+
+fn print_file_ids_tree(db: &Db) -> anyhow::Result<()> {
+    let tree = db.open_tree("file_ids")?;
+    println!("=== file_ids ({} entries) ===", tree.len());
+
+    for entry in &tree {
+        let (key, value) = entry?;
+        let (device, file_index) = key.as_ref().split_at_checked(8).map_or_else(
+            || (0, 0),
+            |(dev, idx)| {
+                let dev: [u8; 8] = dev.try_into().unwrap_or_default();
+                let idx: [u8; 8] = idx.try_into().unwrap_or_default();
+                (u64::from_be_bytes(dev), u64::from_be_bytes(idx))
+            },
+        );
+        let doc_id = value.as_ref().try_into().map_or(0, u64::from_be_bytes);
+        println!("device={device} inode={file_index} => doc_id={doc_id}");
+    }
+
+    println!();
     Ok(())
 }
 

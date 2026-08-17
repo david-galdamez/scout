@@ -48,7 +48,7 @@ enum IndexState {
 
 // Walks through the provided directories, classifies files, and processes them accordingly. Returns a vector of errors encountered during the walk.
 pub fn walk_dirs(
-    dirs: Vec<PathBuf>,
+    dirs: &Vec<PathBuf>,
     exclude: &HashSet<String>,
     db: &Database,
 ) -> Vec<(PathBuf, DirErrors)> {
@@ -56,7 +56,7 @@ pub fn walk_dirs(
     let mut visited_file_ids: HashSet<IVec> = HashSet::new();
 
     for dir in dirs {
-        if let Err(e) = validate_dir(&dir) {
+        if let Err(e) = validate_dir(dir) {
             errors.push((dir.clone(), e));
             continue;
         }

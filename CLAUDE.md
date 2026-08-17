@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Scout is a local file search engine written in Rust. It recursively indexes files from
 user-configured directories, tokenizes text content, and stores an inverted index in an
 embedded `sled` database, searchable via title-prefix match, file-name-token match, and
-BM-25 ranking. A `ratatui` TUI is planned as the frontend (module currently a stub).
+BM-25 ranking. A `ratatui` TUI is the frontend, backed by a periodic indexing pass that runs
+on its own thread so the UI is never blocked on a walk.
 
 ## Commands
 
@@ -26,22 +27,31 @@ Pipeline, wired together in `src/main.rs`:
 config::load_and_validate_config()  ->  Config
         |
         v
-Database::new(db_path)              ->  sled-backed Database
-        |
-        v
-indexer::walk_dirs(include, exclude, &db)
-        |
-        v
-        for each file: index_state (new/unchanged/modified)
-          new      -> classify -> process_text_file / process_binary_and_image_file -> db.index_document / db.index_binary_and_image
-          unchanged -> skipped
-          modified  -> classify -> process_and_reindex_text_file / process_and_reindex_binary_and_images -> db.reindex_text_document / db.reindex_binary_and_image
-        |
-        v
-        after the walk: any indexed file_id not seen during it -> prune_stale_file -> db.delete_document
-        |
-        v
+Database::new(db_path)              ->  sled-backed Database  ---clone()---> background thread
+        |                                                              |
+        v                                                              v
+tui::run(db, index_rx,                                    loop { recv_timeout(deadline) ->
+         config, config_tx)                                       ConfigUpdate  -> maybe reindex now
+   (blocks until the user quits)                                  Timeout       -> reindex
+                                                                    Disconnected  -> break }
+        ^                                                               |
+        | ConfigUpdate (on save, from the config screen)                v
+        +--------------------------------------------------  indexer::walk_dirs(include, exclude, &db)
+                                                            |
+                                                            v
+                                                for each file: index_state (new/unchanged/modified)
+                                                  new      -> classify -> process_text_file / process_binary_and_image_file -> db.index_document / db.index_binary_and_image
+                                                  unchanged -> skipped
+                                                  modified  -> classify -> process_and_reindex_text_file / process_and_reindex_binary_and_images -> db.reindex_text_document / db.reindex_binary_and_image
+                                                            |
+                                                            v
+                                                after the walk: any indexed file_id not seen during it -> prune_stale_file -> db.delete_document
+                                                            |
+                                                            v
+                                        IndexingEvent::Started / Finished { errors } sent back to the TUI
+
 search::Searcher::search(query)     ->  title-prefix match, else BM-25 over term tokens + file-name tokens
+                                          (called directly from the TUI's own `Database` clone on every Enter)
 ```
 
 ### `config`
@@ -168,8 +178,116 @@ matches:
    whose name matches but whose content doesn't. BM-25-scored results are sorted by score
    descending; name-token matches are appended after, unranked.
 
-### `tui`
-`src/tui/mod.rs` is currently an empty stub — not yet implemented.
+### `tui` (`src/tui/`)
+`main.rs` opens `Database` once, clones it for a `std::thread::spawn`ed loop, and creates two
+channels: `mpsc::Sender<IndexingEvent>` (background -> TUI, `Started` / `Finished { errors }`,
+defined in `index.rs`) and `mpsc::Sender<ConfigUpdate>` (TUI -> background, `{ config,
+index_now }`, sent when the user saves the config screen). The background loop tracks a
+`deadline` (`Instant`, starting already-elapsed so the first walk runs immediately at startup)
+and blocks on `config_rx.recv_timeout(deadline - now)`: a `Timeout` runs `reindex` and pushes
+the deadline out another `REINDEX_INTERVAL` (5 minutes); an `Ok(update)` swaps in the new
+`Config` and only reindexes immediately if `update.index_now` is true (i.e. `include`/`exclude`
+actually changed), still resetting the deadline either way; `Disconnected` (the TUI, and with
+it `App`'s `config_tx`, exited) breaks the loop. `main` then calls
+`tui::run(db, &rx, tui_config, config_tx)` with the original `Database` handle and a clone of
+`Config` on the main thread. The background thread is never joined — `Database`/`Searcher`
+reads and writes are safe to interleave across threads (sled transactions), so the TUI can
+search while a walk is still in progress; process exit just drops the thread, which is fine
+since sled writes are crash-safe.
+
+- `app.rs`: `App` owns the `Database` handle, `query`/`results`/`selected` (for the results
+  list), the screen/mode state machine, the last-saved `Config` (plus `config_tx` to notify the
+  background thread on save), `index_status`/`errors` (populated from `IndexingEvent`s), and
+  `results_area`/`results_list_state` (the results `List`'s last-rendered rect and
+  `ListState`, kept so a mouse click's screen coordinates can be translated back into a result
+  index via `result_index_at`). `Screen` is `Home` (landing page) / `Results` (query + list) /
+  `Config` (manage `include`/`exclude`) / `Errors` (per-file errors from the last walk) / `Exit`
+  (a confirmation overlay drawn on top of whichever other screen was active —
+  `App::request_exit` snapshots the current screen into `previous_screen` so cancelling returns
+  to the right place, and resets `exit_choice` to `ExitChoice::No` every time the popup opens so
+  an accidental Enter can't quit; `open_config`/`open_errors` snapshot `previous_screen` the
+  same way). `Action` (`Searching`/`Navigating`, toggled with Tab on the `Results` screen) tracks
+  whether the query box or the results list has focus. `select_next`/`select_previous` wrap
+  around the results list using `checked_add`/`checked_sub` (never raw `+`/`-`, since the crate
+  denies `arithmetic_side_effects`); `set_results` replaces the list and resets `selected` to 0,
+  since the old index may not make sense against a new result set. `on_indexing_event` updates
+  `index_status` and, on `Finished`, replaces `errors` wholesale (not accumulated — each walk's
+  errors supersede the last) and resets `errors_selected`.
+
+  `ConfigDraft` (also in `app.rs`) is a working copy of `Indexing`, created by `open_config`
+  from `App.config` and edited in place — nothing is persisted or sent to the background thread
+  until `save_config`. It tracks which of the two lists (`ConfigList::Include`/`Exclude`) is
+  focused and whether that focus is plain navigation or `AddInput` (typing a new/edited entry,
+  `editing_index: Some` distinguishing an in-place edit from an append). While typing an
+  `Include` entry, `update_suggestions` recomputes filesystem-backed autocomplete
+  `suggestions` on every keystroke (`std::fs::read_dir` on the directory implied by the input's
+  text up to its last `/`, filtered by what follows it, `~`-expanded via `dirs::home_dir()`) —
+  `Exclude` never gets suggestions, since those entries are bare directory names to skip
+  anywhere in the tree, not filesystem paths. `App::save_config` diffs the draft's
+  `include`/`exclude` against the last-saved `Config` to decide `ConfigUpdate.index_now`, writes
+  the new config to `~/.scout.toml` via `config::save_config`, updates `App.config`, and sends
+  the `ConfigUpdate` down `config_tx` — always leaving the config screen on success regardless
+  of whether anything actually changed.
+- `run.rs`: owns the crossterm terminal lifecycle (raw mode + alternate screen + mouse capture,
+  restored on the way out) and the event loop, with key handling branched per `Screen`. Unlike a
+  blocking `event::read()`, the loop calls `terminal.draw`, drains any pending `IndexingEvent`s
+  off `index_rx` via `on_indexing_event`, then `event::poll(POLL_INTERVAL)` (200ms) before
+  reading — so indexing status updates get drawn promptly even when the user isn't pressing
+  anything, not just on the next keypress. A left-click on the `Results` screen is translated via
+  `App::result_index_at` into a result index, which both selects that row and reveals it in the
+  OS file explorer (`opener::reveal_document`) — there's no separate "select via click" gesture,
+  since Up/Down + Enter already cover plain selection. On `Home`, every printable key edits the
+  query (no Tab/Navigating there, since there's nothing to navigate yet) and Enter only
+  transitions to `Results` if the trimmed query is non-empty; F1/F2 open the `Config`/`Errors`
+  screens from either `Home` or `Results`. On `Results`, Enter re-searches while `Searching`, or
+  reveals the selected document (same `reveal_document` as the mouse click) while `Navigating`.
+  `'q'` only requests the exit confirmation while `Action::Navigating` — while `Searching`, it's
+  just a character, otherwise queries containing the letter "q" would be untypeable; `Esc` is the
+  always-available way to open the exit confirmation from `Home`/`Results`. On the `Exit` screen,
+  Left/Right/Tab toggles which button (`ExitChoice::Yes`/`No`) is highlighted and Enter acts on
+  it; `'y'`/`'n'` remain as direct shortcuts. On `Config`, key handling further branches on
+  `ConfigDraft.focus`: while just navigating a list, `a` starts adding, `e`/Enter starts editing
+  the selected entry, `d`/Delete removes it, `s` saves (persists + notifies the background
+  thread) and Esc cancels back to `previous_screen`; while typing into `AddInput`, Tab
+  autocompletes (`Include` only), Enter confirms (an empty input removes the entry if this was
+  an edit, otherwise is dropped), and Esc cancels just the input. On `Errors`, Up/Down move the
+  selection and Enter/Esc return to `previous_screen`.
+- `ui.rs`: `draw` dispatches on `app.screen`; the `Exit` overlay first redraws whichever screen
+  is in `app.previous_screen` underneath itself, then paints the popup on top via `Clear` + a
+  small fixed-size centered rect (`centered_rect_fixed` — deliberately not
+  percentage-of-parent, so it doesn't balloon on large terminals). `draw_home` renders "SCOUT" as
+  large pixel-art text via the `tui-big-text` crate (`PixelSize::Full`) above a centered search
+  box and an `index_status_text` line (shared with `draw_footer` on `Results`, so both screens
+  describe the background walk — `IndexStatus::Pending`/`Indexing`/`Done { errors }` — the same
+  way). `draw_results_screen` renders a small "SCOUT" label pinned top-left next to the search
+  box, the results `List` (with the selected row highlighted only when `Action::Navigating`;
+  `app.results_area` is recorded on every draw, even when empty, so a click while there are no
+  results reliably misses rather than hit-testing a stale area), and a footer whose help text
+  depends on `Action` and whose top-right corner shows `index_status_text`. Each result row
+  spans three lines (name, path, then kind/extension/size/modified via `format.rs`, the kind tag
+  colored per `theme::kind_color`) — `App`'s `RESULT_ITEM_HEIGHT` constant must stay in sync with
+  this for mouse hit-testing to line up. `draw_config_screen` renders `Include`/`Exclude` as two
+  side-by-side lists (`draw_config_list`, shared for both) with a help footer that changes text
+  depending on `ConfigFocus`; while `AddInput` is active, an inline text box (prefixed `Add>` or
+  `Edit>`) is drawn in place of the list's own hint line, wrapping and growing upward as needed,
+  with a suggestions line above it when autocomplete candidates exist. `draw_errors_screen` lists
+  the last walk's per-file errors (path + `DirErrors`'s `Display` text) in a navigable `List`.
+  Colors are centralized in `theme.rs` rather than inlined per-widget.
+- `theme.rs`: a blue-toned palette (`PRIMARY`, `ACCENT`, `SUCCESS`, `WARNING`, `DANGER`, `TEXT`,
+  `DIM`) plus style helpers (`focused(bool)`, `dim()`, `text()`, `selected()`, `confirm()`/
+  `safe()` for the exit popup's Yes/No buttons, and `kind_color(FileType)` so each result's kind
+  tag gets its own accent color) — every bordered block/list/popup in `ui.rs` goes through these
+  instead of ad hoc `Style`s, so the look stays consistent.
+- `format.rs`: display formatting for result metadata — `size` (bytes -> `"1.5 KB"`, stepping
+  through units in `f64` rather than integer division), `modified` (unix seconds -> `"YYYY-MM-DD
+  HH:MM"` via the `time` crate, falling back to a placeholder for anything out of range,
+  including the `modified: 0` sentinel `util::modified_secs` returns when a file's mtime
+  couldn't be read), `extension` (uppercased, no leading dot, `None` when the path has none), and
+  `kind_label`. Has unit tests — check these when changing result-metadata formatting.
+- `opener.rs`: a thin wrapper around the `opener` crate's `reveal`, used by both the mouse-click
+  and Enter-on-`Results` paths to show the selected document in the OS's file explorer.
+- `index.rs`: defines `IndexingEvent` (background -> TUI) and `ConfigUpdate` (TUI -> background,
+  `{ config, index_now }`).
 
 ## Notes for future work
 
@@ -187,3 +305,19 @@ matches:
   references `doc_id` outside the database itself. Revisit if either becomes a real cost —
   e.g. once a feature hangs metadata off `doc_id` (favorites, history) or this shows up as a
   perf problem on large files moved across volumes.
+- Opening a document only reveals it in the OS file explorer (`opener::reveal`) — there's no
+  "open with the default app" alternative (e.g. a modifier-click or a second shortcut), which
+  would need a second `opener` call (`opener::open`) and a key/mouse-gesture decision for how
+  the two should coexist.
+- The config screen's `Include` autocomplete only completes to a full existing subdirectory
+  (`ConfigDraft::update_suggestions` filters `std::fs::read_dir` results) — there's no way to
+  type a path that doesn't exist yet and have it accepted as a not-yet-created directory, nor
+  any validation on save that `Include` entries actually exist or that `Include`/`Exclude`
+  don't overlap in a way that makes an entry pointless.
+- The `Errors` screen (`Screen::Errors`, F2) always shows only the *last* walk's errors,
+  replaced wholesale on every `IndexingEvent::Finished` — there's no history across walks, so a
+  transient error (e.g. a file locked by another process during one walk) is indistinguishable
+  from a persistent one unless the user happens to check right after it occurs.
+- No way to trigger a manual reindex from the TUI outside of saving the config screen with a
+  changed `include`/`exclude` (which piggybacks a reindex as a side effect) — a user who just
+  wants to force a refresh has to wait out the rest of `REINDEX_INTERVAL` (5 minutes).

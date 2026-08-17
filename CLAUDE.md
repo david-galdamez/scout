@@ -7,8 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Scout is a local file search engine written in Rust. It recursively indexes files from
 user-configured directories, tokenizes text content, and stores an inverted index in an
 embedded `sled` database, searchable via title-prefix match, file-name-token match, and
-BM-25 ranking. A `ratatui` TUI is the frontend, backed by a periodic indexing pass that runs
-on its own thread so the UI is never blocked on a walk.
+BM-25 ranking. A `ratatui` TUI is the frontend, backed by an event-driven indexing pass —
+triggered by real filesystem changes (via `notify`), not a timer — that runs on its own
+thread so the UI is never blocked on a walk.
 
 ## Commands
 
@@ -30,13 +31,20 @@ config::load_and_validate_config()  ->  Config
 Database::new(db_path)              ->  sled-backed Database  ---clone()---> background thread
         |                                                              |
         v                                                              v
-tui::run(db, index_rx,                                    loop { recv_timeout(deadline) ->
-         config, config_tx)                                       ConfigUpdate  -> maybe reindex now
-   (blocks until the user quits)                                  Timeout       -> reindex
-                                                                    Disconnected  -> break }
-        ^                                                               |
-        | ConfigUpdate (on save, from the config screen)                v
-        +--------------------------------------------------  indexer::walk_dirs(include, exclude, &db)
+notify::recommended_watcher(filter)  ->                     reindex once at startup, then:
+  -> watch every indexer::indexable_dirs(include, exclude)   loop { select! {
+        (non-recursive, one per surviving dir)                          recv(config_rx) ->
+        |                                                                  ConfigUpdate: resync watches,
+        v                                                                  maybe reindex now
+tui::run(db, index_rx,                                                  recv(notify_rx) ->
+         config, config_tx)                                                qualifying path: watch it if new
+   (blocks until the user quits)                                           dir, push debounce deadline out
+        ^                                                                recv(deadline) -> reindex if pending
+        | ConfigUpdate (on save, from the config screen)                either side disconnected -> break
+        +--------------------------------------------------              } }
+                                                            |
+                                                            v
+                                                    indexer::walk_dirs(include, exclude, &db)
                                                             |
                                                             v
                                                 for each file: index_state (new/unchanged/modified)
@@ -139,7 +147,8 @@ against what it saw.
   previous engine (`walkdir`) had no such behavior — dotfiles are still indexed unless excluded
   by name, same as before. The configured `exclude: &HashSet<String>` set is layered on top via
   `filter_entry` as an additional, explicit prune (unchanged config semantics from before this
-  rewrite).
+  rewrite). This whole `WalkBuilder` configuration is factored into a shared `configure_walker`
+  helper, reused by `indexable_dirs` (below) so the two can't drift on what counts as in scope.
 
   `errors: Mutex<Vec<(PathBuf, DirErrors)>>` and `visited_file_ids: Mutex<HashSet<IVec>>` are
   shared across every worker thread the walk spawns (`ignore::WalkParallel::run` uses
@@ -174,6 +183,12 @@ against what it saw.
   id or doc has already vanished (e.g. a race with another prune). This is how deletes and
   moves-out-of-scope get reflected in the index — a file whose `file_id` is never seen again
   during a walk is treated as gone.
+
+  `indexable_dirs(dirs, exclude)` reuses `configure_walker` too, but walks it sequentially
+  (`.build()`, not `.build_parallel()`) and collects only directory entries (including each
+  root in `dirs` itself), skipping the file-classification/indexing work entirely. It exists
+  solely to build the filesystem-watch list in `main.rs` — see `### tui` below — so the set of
+  directories being *watched* always matches the set `walk_dirs` would actually *index*.
 - `classifier.rs` / `extension_map.rs`: classifies a path as `Text`/`Image`/`Binary`, first
   by extension lookup (`EXTENSION_MAP`), falling back to content sniffing via
   `content_inspector::inspect` on the first 8KB when the extension is unknown.
@@ -210,21 +225,88 @@ matches:
    descending; name-token matches are appended after, unranked.
 
 ### `tui` (`src/tui/`)
-`main.rs` opens `Database` once, clones it for a `std::thread::spawn`ed loop, and creates two
-channels: `mpsc::Sender<IndexingEvent>` (background -> TUI, `Started` / `Finished { errors }`,
-defined in `index.rs`) and `mpsc::Sender<ConfigUpdate>` (TUI -> background, `{ config,
-index_now }`, sent when the user saves the config screen). The background loop tracks a
-`deadline` (`Instant`, starting already-elapsed so the first walk runs immediately at startup)
-and blocks on `config_rx.recv_timeout(deadline - now)`: a `Timeout` runs `reindex` and pushes
-the deadline out another `REINDEX_INTERVAL` (5 minutes); an `Ok(update)` swaps in the new
-`Config` and only reindexes immediately if `update.index_now` is true (i.e. `include`/`exclude`
-actually changed), still resetting the deadline either way; `Disconnected` (the TUI, and with
-it `App`'s `config_tx`, exited) breaks the loop. `main` then calls
-`tui::run(db, &rx, tui_config, config_tx)` with the original `Database` handle and a clone of
-`Config` on the main thread. The background thread is never joined — `Database`/`Searcher`
-reads and writes are safe to interleave across threads (sled transactions), so the TUI can
-search while a walk is still in progress; process exit just drops the thread, which is fine
-since sled writes are crash-safe.
+`main.rs` opens `Database` once and clones it for a `std::thread::spawn`ed loop. Reindexing
+is event-driven, not timer-based, built directly on `notify::recommended_watcher` rather than
+a debounce crate — see below for why. Three channels: `mpsc::Sender<IndexingEvent>`
+(background -> TUI, `Started` / `Finished { errors }`, defined in `index.rs`, untouched by any
+of this — the TUI still drains it with `try_recv()` in its own poll loop);
+`crossbeam_channel::Sender<ConfigUpdate>` (TUI -> background, `{ config, index_now }`, sent
+when the user saves the config screen) — this one *is* `crossbeam_channel` rather than
+`std::sync::mpsc`, specifically so the background loop can `crossbeam_channel::select!` over
+it and the notify channel at once (`std::sync::mpsc` has no equivalent to wait on two
+receivers simultaneously); and `crossbeam_channel::Sender<notify::Result<PathBuf>>`
+(`notify_tx`/`notify_rx`), fed by the watcher's own event-handler closure rather than a
+debounce crate's internal wiring.
+
+**Why not `notify-debouncer-mini`/`-full`:** `notify::recommended_watcher`'s Linux (inotify)
+backend hardcodes `WatchMask::OPEN` into every watch, with no way to turn it off — so every
+`File::open` call (including our *own*, e.g. `process_text_file` reading a file to tokenize
+it during a reindex) fires an `EventKind::Access(AccessKind::Open(_))` event. Both debounce
+crates were checked directly in their source and neither filters by `EventKind` before
+treating an event as a real change — `notify-debouncer-mini`'s `add_event` and
+`notify-debouncer-full`'s `add_event` both accept every raw event unconditionally (the `_`
+match arm in `-full`'s case). Left unfiltered, that's a self-sustaining loop: reindexing
+opens every file, which "changes" every file from the watcher's point of view, which
+debounces into another reindex, forever. Since neither crate exposes a hook to filter *before*
+their internal debounce logic runs (they own the raw watcher callback internally), the fix is
+to not use either: `main` builds a `RecommendedWatcher` directly with its own handler closure
+that drops anything matching `EventKind::Access(_)` before it ever reaches `notify_tx`, and
+debouncing is hand-rolled in the `select!` loop instead of via a crate (see below).
+
+Before spawning the thread, `main` builds the initial watch set: `indexer::indexable_dirs`
+(see `file_walker.rs` below) enumerates every directory that would survive `walk_dirs`'s own
+filtering, and each one gets a **non-recursive** watch (`watch_all`/`watch_one`) — not one
+recursive watch per `include` root. This is deliberate: a recursive watch has no way to skip
+gitignored/excluded subtrees, so on a large tree it would register far more OS-level watches
+than are actually indexed (risking the platform's watch-count limit, e.g. Linux's
+`fs.inotify.max_user_watches`) for directories like `node_modules`/`target`/`.git` that were
+never going to be indexed anyway. The background loop then runs one `reindex` immediately
+(the old timer's "already-elapsed deadline" startup trick is gone — this is just a direct
+call), then declares `pending: bool` and `deadline: Receiver<Instant>` (`crossbeam_channel::never()`
+initially, so that arm of the `select!` stays permanently unready until something's pending)
+and enters `loop { select! { recv(config_rx) => ..., recv(notify_rx) => ..., recv(deadline) => ... } }`,
+blocking indefinitely (no fixed-interval timeout — nothing to poll anymore):
+- `config_rx`: `Err` (channel disconnected, meaning the TUI — and with it `App`'s
+  `config_tx` — exited) breaks the loop. `Ok(update)` swaps in the new `Config` and, only if
+  `update.index_now` (i.e. `include`/`exclude` actually changed), recomputes the directory set
+  and calls `resync_watches` — diffs it against the live `watched_dirs` set (unwatching
+  anything dropped, watching anything added) — before reindexing immediately (config saves
+  aren't debounced, only filesystem events are). Diffing against the actual watched set
+  rather than a stale `Config` snapshot is what makes this correct across more than one
+  config change in a session.
+- `notify_rx`: `Err` (the watcher's own background thread went away) breaks the loop.
+  `Ok(Err(e))` (a watch error) is logged, not fatal. `Ok(Ok(path))` — a path that survived the
+  `Access`-event filter — logs it, calls `watch_new_directory` (self-healing: because watches
+  are non-recursive, a brand-new subdirectory needs its own watch registered or everything
+  under it goes unseen until restart; this only checks the path's own name against the literal
+  `exclude` set, not full `.gitignore` fidelity for a directory that didn't exist yet — an
+  accepted approximation, since `walk_dirs` re-applies full filtering on the actual reindex
+  that follows, so at worst this over-watches, never mis-indexes), then sets `pending = true`
+  and pushes `deadline` out another `DEBOUNCE_TIMEOUT` (2s) — this is the debounce: any
+  further qualifying event before the deadline fires just pushes it out again, so a burst
+  collapses into one reindex once things go quiet rather than reindexing per event.
+- `deadline`: fires `DEBOUNCE_TIMEOUT` after the *last* qualifying event. If `pending`,
+  reindexes once and clears it; either way resets `deadline` back to `never()`. The watcher
+  only ever hands us a path, never a kind (create/modify/remove/file-vs-dir all collapse to
+  "something happened here") — reindexing always falls back to asking the filesystem/
+  `index_state` what actually happened rather than trusting the event.
+
+`main` then calls `tui::run(db, &rx, tui_config, config_tx)` with the original `Database`
+handle and a clone of `Config` on the main thread. The background thread is never joined —
+`Database`/`Searcher` reads and writes are safe to interleave across threads (sled
+transactions), so the TUI can search while a walk is still in progress; process exit just
+drops the thread (and with it the watcher, which stops watching), which is fine since sled
+writes are crash-safe.
+
+All of the above (watch/unwatch failures, the watcher's own errors, and — usefully for
+diagnosing surprise reindexes — every path that triggered one) is logged via `log_line` to a
+plain file, `<data dir>/scout/scout.log` (append mode, RFC 3339 timestamps), computed by
+`open_log`/`log_path` as a sibling of the sled database directory. Not `eprintln!`: the TUI
+holds the terminal in raw mode + the alternate screen for its entire run, so stderr output
+either doesn't show up at all or shows up mangled once the terminal is restored — a log file
+is the only way to actually see this while the app is running. `Option<File>` throughout
+(never `?`/`unwrap`) — if the log can't be opened, diagnostics are silently lost rather than
+taking down indexing over it.
 
 - `app.rs`: `App` owns the `Database` handle, `query`/`results`/`selected` (for the results
   list), the screen/mode state machine, the last-saved `Config` (plus `config_tx` to notify the
@@ -359,6 +441,25 @@ since sled writes are crash-safe.
   replaced wholesale on every `IndexingEvent::Finished` — there's no history across walks, so a
   transient error (e.g. a file locked by another process during one walk) is indistinguishable
   from a persistent one unless the user happens to check right after it occurs.
-- No way to trigger a manual reindex from the TUI outside of saving the config screen with a
-  changed `include`/`exclude` (which piggybacks a reindex as a side effect) — a user who just
-  wants to force a refresh has to wait out the rest of `REINDEX_INTERVAL` (5 minutes).
+- No way to trigger a manual reindex from the TUI. Reindexing is purely event-driven now (see
+  `### tui` above) — a filesystem change via the watcher, or saving the config screen with a
+  changed `include`/`exclude`. There's no timer fallback anymore and no explicit "reindex now"
+  key, so a change the watcher genuinely misses (e.g. a change made while the app wasn't
+  running, or one of the approximations noted below) has no way to be picked up short of
+  restarting the app or editing a watched file to trigger *some* event.
+- The self-healing watch logic in `main.rs` (`watch_new_directory`) only checks a new
+  directory's own name against the literal `exclude` set, not full `.gitignore` matching —
+  a brand-new directory whose *name* isn't excluded but would be gitignored (e.g. matching a
+  glob pattern, or inheriting exclusion from a parent's rule) gets watched anyway until the
+  next full reindex re-derives what's actually indexable. Harmless for index correctness
+  (`walk_dirs` still applies full filtering on every reindex), just some avoidable watch
+  overhead. Revisit if it turns out to matter in practice — e.g. by consulting an
+  `ignore::gitignore::Gitignore` matcher built for the relevant project root instead of just
+  the literal exclude-name check.
+- Every filesystem-event-triggered reindex (`main.rs`'s `notify_rx` arm) still calls
+  `walk_dirs` over the *entire* `include` list, the same as the old timer did — just far less
+  often now (only on an actual debounced change, not every 5 minutes regardless). A real
+  further optimization would be reindexing only the changed path(s) from the event batch,
+  reusing the already-private per-path `index_file`/`reindex_file` in `file_walker.rs` instead
+  of re-walking everything. Not done yet — separate scope from just making reindexing
+  event-driven.

@@ -69,6 +69,37 @@ fn worker_thread_count() -> usize {
         .max(1)
 }
 
+// Configures a `WalkBuilder` rooted at `dir` with this app's filtering rules — shared by
+// `walk_dirs` (which walks it in parallel, indexing every file) and `indexable_dirs` (which
+// walks it sequentially, collecting only directories, to build the filesystem-watch list) so
+// the two can never drift apart on what counts as "in scope."
+fn configure_walker(dir: &Path, exclude: &HashSet<String>) -> WalkBuilder {
+    let exclude = exclude.clone();
+    let mut builder = WalkBuilder::new(dir);
+    builder
+        .threads(worker_thread_count())
+        .filter_entry(move |entry| !exclude.contains(entry.file_name().to_str().unwrap_or("")))
+        // Only `.gitignore`/`.ignore` files *inside* the walked tree apply — one sitting
+        // above `dir` (e.g. in the user's home directory) shouldn't reach in and hide
+        // files the user explicitly configured to be indexed.
+        .parents(false)
+        // The previous engine (`walkdir`) had no notion of "hidden", so dotfiles were
+        // indexed unless excluded by name — keep that behavior rather than silently
+        // dropping every dotfile now that `ignore`'s default is to skip them.
+        .hidden(false)
+        // Same reasoning as `parents`: the user's global git excludesFile is unrelated to
+        // this app and lives outside the walked tree, so don't let it affect what's
+        // indexed.
+        .git_global(false);
+    // `.gitignore` respect (`git_ignore`, on by default) only activates inside an actual
+    // git repository — `require_git` (also on by default, left as-is here) means a
+    // `.gitignore`-named file with no `.git` anywhere at/above it is not treated
+    // specially. That's fine for the common case this is meant to solve: `dir` itself
+    // (e.g. `~/Dev`) usually isn't a repo, but the individual projects nested under it
+    // are, and each one's own `.gitignore` still applies once the walk descends into it.
+    builder
+}
+
 // Walks through the provided directories, classifies files, and processes them accordingly.
 // Returns a vector of errors encountered during the walk.
 //
@@ -93,29 +124,7 @@ pub fn walk_dirs(
             continue;
         }
 
-        let exclude = exclude.clone();
-        let mut builder = WalkBuilder::new(dir);
-        builder
-            .threads(worker_thread_count())
-            .filter_entry(move |entry| !exclude.contains(entry.file_name().to_str().unwrap_or("")))
-            // Only `.gitignore`/`.ignore` files *inside* the walked tree apply — one sitting
-            // above `dir` (e.g. in the user's home directory) shouldn't reach in and hide
-            // files the user explicitly configured to be indexed.
-            .parents(false)
-            // The previous engine (`walkdir`) had no notion of "hidden", so dotfiles were
-            // indexed unless excluded by name — keep that behavior rather than silently
-            // dropping every dotfile now that `ignore`'s default is to skip them.
-            .hidden(false)
-            // Same reasoning as `parents`: the user's global git excludesFile is unrelated to
-            // this app and lives outside the walked tree, so don't let it affect what's
-            // indexed.
-            .git_global(false);
-        // `.gitignore` respect (`git_ignore`, on by default) only activates inside an actual
-        // git repository — `require_git` (also on by default, left as-is here) means a
-        // `.gitignore`-named file with no `.git` anywhere at/above it is not treated
-        // specially. That's fine for the common case this is meant to solve: `dir` itself
-        // (e.g. `~/Dev`) usually isn't a repo, but the individual projects nested under it
-        // are, and each one's own `.gitignore` still applies once the walk descends into it.
+        let builder = configure_walker(dir, exclude);
 
         builder.build_parallel().run(|| {
             Box::new(|entry_result: Result<DirEntry, ignore::Error>| {
@@ -158,6 +167,30 @@ pub fn walk_dirs(
     }
 
     recover(errors.into_inner())
+}
+
+// Every directory that would survive `walk_dirs`'s filtering (the configured `exclude` set,
+// plus `.gitignore`/`.ignore` rules), including each root in `dirs` itself. Used to build a
+// filesystem-watch list that mirrors what's actually indexed, rather than watching
+// dependency/build directories that would never be indexed in the first place. A plain
+// sequential walk is enough here — it's directories only (no file classification/indexing
+// work), and only run at startup or when `include`/`exclude` changes, not per file.
+pub fn indexable_dirs(dirs: &[PathBuf], exclude: &HashSet<String>) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+
+    for dir in dirs {
+        if validate_dir(dir).is_err() {
+            continue;
+        }
+
+        for entry in configure_walker(dir, exclude).build().flatten() {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                result.push(entry.path().to_path_buf());
+            }
+        }
+    }
+
+    result
 }
 
 // Classifies and indexes/reindexes a single file, recording any failure into `errors` rather
@@ -441,5 +474,31 @@ mod tests {
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         let file_ids_after = db.get_all_file_ids().expect("get_all_file_ids failed");
         assert_eq!(file_ids_after.len(), FILE_COUNT);
+    }
+
+    #[test]
+    fn indexable_dirs_matches_what_walk_dirs_would_index() {
+        let tree = tempfile::tempdir().expect("failed to create temp dir");
+
+        // Same shape as `respects_gitignore_inside_the_walked_tree`: a nested "project" with
+        // its own `.git` marker and `.gitignore`, plus a literal `exclude` entry alongside it —
+        // `indexable_dirs` should reflect both kinds of filtering.
+        let project = tree.path().join("project");
+        std::fs::create_dir(&project).expect("failed to create dir");
+        std::fs::create_dir(project.join(".git")).expect("failed to create dir");
+        std::fs::write(project.join(".gitignore"), "ignored/\n")
+            .expect("failed to write .gitignore");
+        std::fs::create_dir(project.join("ignored")).expect("failed to create dir");
+        std::fs::create_dir(project.join("kept")).expect("failed to create dir");
+        std::fs::create_dir(tree.path().join("node_modules")).expect("failed to create dir");
+
+        let exclude = HashSet::from(["node_modules".to_string()]);
+        let dirs = indexable_dirs(&[tree.path().to_path_buf()], &exclude);
+
+        assert!(dirs.contains(&tree.path().to_path_buf()));
+        assert!(dirs.contains(&project));
+        assert!(dirs.contains(&project.join("kept")));
+        assert!(!dirs.contains(&project.join("ignored")));
+        assert!(!dirs.contains(&tree.path().join("node_modules")));
     }
 }

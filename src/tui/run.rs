@@ -1,8 +1,4 @@
-use std::{
-    io,
-    sync::mpsc::{Receiver, Sender},
-    time::Duration,
-};
+use std::{io, sync::mpsc::Receiver, time::Duration};
 
 use ratatui::{
     Terminal,
@@ -40,7 +36,7 @@ pub fn run(
     db: Database,
     index_rx: &Receiver<IndexingEvent>,
     config: Config,
-    config_tx: Sender<ConfigUpdate>,
+    config_tx: crossbeam_channel::Sender<ConfigUpdate>,
 ) -> Result<(), TuiErrors> {
     enable_raw_mode()?;
     let mut stderr = io::stderr();

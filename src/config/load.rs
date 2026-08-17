@@ -56,6 +56,15 @@ pub fn load_and_validate_config() -> Result<Config, ConfigError> {
     Ok(config)
 }
 
+// Validates and persists `config` back to `~/.scout.toml`, overwriting whatever was there.
+pub fn save_config(config: &Config) -> Result<(), ConfigError> {
+    validate_config(config)?;
+    let path = Config::default_path()?;
+    let config_str = toml::to_string(config)?;
+    fs::write(path, config_str)?;
+    Ok(())
+}
+
 // Loads the configuration from the specified path and returns a Config struct.
 fn load_config(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
     let config_str = fs::read_to_string(path)?;

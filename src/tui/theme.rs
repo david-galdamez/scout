@@ -33,7 +33,7 @@ pub fn selected() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-// Highlight for the exit popup's "Sí" (quit) button when active — red reads as the
+// Highlight for the exit popup's "Yes" (quit) button when active — red reads as the
 // destructive choice, distinct from `selected()`'s purple used for list navigation.
 pub fn confirm() -> Style {
     Style::default()

@@ -37,7 +37,7 @@ pub fn modified(secs: u64) -> String {
         .and_then(|secs| OffsetDateTime::from_unix_timestamp(secs).ok())
         .and_then(|datetime| datetime.format(&Rfc3339).ok())
         .map_or_else(
-            || "desconocida".to_string(),
+            || "unknown".to_string(),
             |formatted| formatted.replace('T', " ").replace('Z', ""),
         )
 }

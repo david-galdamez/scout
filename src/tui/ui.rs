@@ -3,12 +3,15 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use tui_big_text::{BigText, PixelSize};
 
 use crate::tui::{
-    app::{Action, App, ExitChoice, IndexStatus, Screen},
+    app::{
+        Action, App, ConfigDraft, ConfigFocus, ConfigList, ExitChoice, IndexStatus, Screen,
+        suggestion_label,
+    },
     format, theme,
 };
 
@@ -17,21 +20,21 @@ use crate::tui::{
 fn index_status_text(status: IndexStatus) -> (String, Style) {
     match status {
         IndexStatus::Pending => (
-            "Indexación: pendiente".to_string(),
+            "Indexing: pending".to_string(),
             Style::default().fg(theme::DIM),
         ),
         IndexStatus::Indexing => (
-            "Indexando…".to_string(),
+            "Indexing…".to_string(),
             Style::default()
                 .fg(theme::PRIMARY)
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ),
         IndexStatus::Done { errors: 0 } => (
-            "Índice actualizado".to_string(),
+            "Index up to date".to_string(),
             Style::default().fg(theme::SUCCESS),
         ),
         IndexStatus::Done { errors } => (
-            format!("Índice actualizado · {errors} errores"),
+            format!("Index up to date · {errors} errors"),
             Style::default().fg(theme::WARNING),
         ),
     }
@@ -41,10 +44,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Home => draw_home(frame, app),
         Screen::Results => draw_results_screen(frame, app),
+        Screen::Config => draw_config_screen(frame, app),
+        Screen::Errors => draw_errors_screen(frame, app),
         // The confirmation overlay always sits on top of whichever screen was active before
         // it, so redraw that one underneath rather than leaving a blank frame behind it.
         Screen::Exit => match app.previous_screen {
             Screen::Results => draw_results_screen(frame, app),
+            Screen::Config => draw_config_screen(frame, app),
+            Screen::Errors => draw_errors_screen(frame, app),
             Screen::Home | Screen::Exit => draw_home(frame, app),
         },
     }
@@ -78,7 +85,7 @@ fn draw_home(frame: &mut Frame, app: &App) {
 
     draw_input_box(frame, app, centered_rect(60, 100, input_area), true);
 
-    let hint = Paragraph::new("Enter: buscar · Esc: salir")
+    let hint = Paragraph::new("Enter: search · F1: settings · F2: errors · Esc: quit")
         .alignment(Alignment::Center)
         .style(theme::dim());
     frame.render_widget(hint, centered_rect(60, 100, hint_area));
@@ -131,11 +138,11 @@ fn draw_results_screen(frame: &mut Frame, app: &mut App) {
 fn draw_input_box(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Buscar")
+        .title("Search")
         .border_style(theme::focused(focused));
 
     let text = if app.query.is_empty() && focused {
-        Line::from(Span::styled("Escribí para buscar…", theme::dim()))
+        Line::from(Span::styled("Type to search…", theme::dim()))
     } else {
         Line::from(Span::styled(app.query.as_str(), theme::text()))
     };
@@ -148,7 +155,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("Resultados ({})", app.results.len()))
+        .title(format!("Results ({})", app.results.len()))
         .border_style(theme::focused(focused));
 
     // Recorded on every draw (not just when non-empty) so a click while there are no results
@@ -157,9 +164,9 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if app.results.is_empty() {
         let message = if app.query.is_empty() {
-            "Sin búsqueda todavía"
+            "No search yet"
         } else {
-            "Sin resultados"
+            "No results"
         };
         frame.render_widget(
             Paragraph::new(Span::styled(message, theme::dim())).block(block),
@@ -180,8 +187,8 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
             let kind = format::kind_label(metadata.kind);
             let extension = format::extension(&metadata.path);
             let details = format!(
-                "  ·  Extension: {}  ·  Tamaño: {}  ·  modificado: {}",
-                extension.as_deref().unwrap_or("sin extensión"),
+                "  ·  Extension: {}  ·  Size: {}  ·  modified: {}",
+                extension.as_deref().unwrap_or("no extension"),
                 format::size(metadata.size),
                 format::modified(metadata.modified),
             );
@@ -215,15 +222,19 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let help = match app.action {
-        Action::Searching => "Enter: buscar · Tab: navegar resultados · Esc: salir",
-        Action::Navigating => "↑/↓: mover selección · Tab: volver a buscar · q/Esc: salir",
+        Action::Searching => {
+            "Enter: search · Tab: navigate results · F1: settings · F2: errors · Esc: quit"
+        }
+        Action::Navigating => {
+            "↑/↓: move selection · Tab: back to search · F1: settings · F2: errors · q/Esc: quit"
+        }
     };
 
     let (status_text, status_style) = index_status_text(app.index_status);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Ayuda")
+        .title("Help")
         .title_top(Line::from(Span::styled(status_text, status_style)).right_aligned())
         .border_style(theme::dim());
 
@@ -239,7 +250,7 @@ fn draw_exit_popup(frame: &mut Frame, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Salir")
+        .title("Quit")
         .border_style(theme::focused(true));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -256,7 +267,7 @@ fn draw_exit_popup(frame: &mut Frame, app: &App) {
         .areas(inner);
 
     frame.render_widget(
-        Paragraph::new("¿Salir de Scout?")
+        Paragraph::new("Quit Scout?")
             .alignment(Alignment::Center)
             .style(theme::text()),
         question_area,
@@ -267,7 +278,7 @@ fn draw_exit_popup(frame: &mut Frame, app: &App) {
         ExitChoice::No => (theme::dim(), theme::safe()),
     };
     let buttons = Line::from(vec![
-        Span::styled("  Sí  ", yes_style),
+        Span::styled("  Yes  ", yes_style),
         Span::raw("   "),
         Span::styled("  No  ", no_style),
     ]);
@@ -277,10 +288,246 @@ fn draw_exit_popup(frame: &mut Frame, app: &App) {
     );
 
     frame.render_widget(
-        Paragraph::new("←/→: elegir · Enter: confirmar")
+        Paragraph::new("←/→: choose · Enter: confirm")
             .alignment(Alignment::Center)
             .style(theme::dim()),
         hint_area,
+    );
+}
+
+// The config screen: `include` and `exclude` side by side, each navigable independently, with
+// an inline text input that appears in place of the list's own hint line while adding an entry.
+fn draw_config_screen(frame: &mut Frame, app: &App) {
+    let Some(draft) = app.config_draft.as_ref() else {
+        return;
+    };
+
+    let [title_area, lists_area, footer_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
+        .areas(frame.area());
+
+    let title = Paragraph::new("Settings")
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(theme::PRIMARY)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::dim()),
+        );
+    frame.render_widget(title, title_area);
+
+    let [include_area, exclude_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .areas(lists_area);
+
+    draw_config_list(
+        frame,
+        draft,
+        ConfigList::Include,
+        "Include",
+        draft
+            .include
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned()),
+        include_area,
+    );
+    draw_config_list(
+        frame,
+        draft,
+        ConfigList::Exclude,
+        "Exclude",
+        draft.exclude.iter().cloned(),
+        exclude_area,
+    );
+
+    let help = match draft.focus {
+        ConfigFocus::List(_) => {
+            "Tab: switch list · ↑/↓: move · a: add · e/Enter: edit · d: remove · s: save · Esc: cancel"
+        }
+        ConfigFocus::AddInput(ConfigList::Include) => {
+            "Enter: confirm · Tab: autocomplete · Esc: cancel"
+        }
+        ConfigFocus::AddInput(ConfigList::Exclude) => "Enter: confirm · Esc: cancel",
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(help, theme::dim())).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Help")
+                .border_style(theme::dim()),
+        ),
+        footer_area,
+    );
+}
+
+fn draw_config_list(
+    frame: &mut Frame,
+    draft: &ConfigDraft,
+    list: ConfigList,
+    title: &str,
+    entries: impl Iterator<Item = String>,
+    area: Rect,
+) {
+    let focused = matches!(
+        draft.focus,
+        ConfigFocus::List(active) | ConfigFocus::AddInput(active) if active == list
+    );
+
+    let items: Vec<ListItem> = entries
+        .enumerate()
+        .map(|(index, entry)| {
+            let selected =
+                focused && matches!(draft.focus, ConfigFocus::List(_)) && index == draft.selected;
+            let style = if selected {
+                theme::selected()
+            } else {
+                theme::text()
+            };
+            ListItem::new(Line::from(Span::styled(entry, style)))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string())
+        .border_style(theme::focused(focused));
+
+    frame.render_widget(List::new(items).block(block), area);
+
+    if matches!(draft.focus, ConfigFocus::AddInput(active) if active == list) {
+        let width = area.width.saturating_sub(2).max(1);
+        let prefix = if draft.editing_index.is_some() {
+            "Edit> "
+        } else {
+            "Add> "
+        };
+        let text = format!("{prefix}{}", draft.input);
+
+        // How many rows the input needs once wrapped to `width`, capped to whatever's left
+        // inside the block's borders (minus one row reserved for the suggestions line above
+        // it) so a very long path grows the input box instead of overflowing it.
+        let content_rows = u16::try_from(text.chars().count())
+            .unwrap_or(u16::MAX)
+            .div_ceil(width)
+            .max(1);
+        let max_input_height = area.height.saturating_sub(3).max(1);
+        let input_height = content_rows.min(max_input_height);
+
+        let input_area = Rect {
+            x: area.x.saturating_add(1),
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(1).saturating_sub(input_height)),
+            width,
+            height: input_height,
+        };
+        frame.render_widget(Clear, input_area);
+        frame.render_widget(
+            Paragraph::new(Span::styled(text, theme::focused(true))).wrap(Wrap { trim: false }),
+            input_area,
+        );
+
+        // Only room for the suggestions line if the (now possibly multi-row) input box hasn't
+        // grown all the way up to the block's top border.
+        if !draft.suggestions.is_empty() && input_area.y > area.y.saturating_add(1) {
+            let suggestions_area = Rect {
+                x: area.x.saturating_add(1),
+                y: input_area.y.saturating_sub(1),
+                width,
+                height: 1,
+            };
+            let line = draft
+                .suggestions
+                .iter()
+                .map(|path| suggestion_label(path))
+                .collect::<Vec<_>>()
+                .join("  ");
+            frame.render_widget(Clear, suggestions_area);
+            frame.render_widget(
+                Paragraph::new(Span::styled(line, theme::dim())),
+                suggestions_area,
+            );
+        }
+    }
+}
+
+// Lists the per-file errors from the most recently finished walk (permission denials, symlink
+// loops, I/O errors, etc.) — each entry's path alongside the error's `Display` text.
+fn draw_errors_screen(frame: &mut Frame, app: &App) {
+    let [title_area, list_area, footer_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
+        .areas(frame.area());
+
+    let title = Paragraph::new(format!("Errors ({})", app.errors.len()))
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(theme::PRIMARY)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::dim()),
+        );
+    frame.render_widget(title, title_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::focused(true));
+
+    if app.errors.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("No errors from the last walk", theme::dim())).block(block),
+            list_area,
+        );
+    } else {
+        let items: Vec<ListItem> = app
+            .errors
+            .iter()
+            .map(|(path, error)| {
+                ListItem::new(vec![
+                    Line::from(Span::styled(
+                        path.to_string_lossy().into_owned(),
+                        theme::text(),
+                    )),
+                    Line::from(Span::styled(error.to_string(), theme::dim())),
+                ])
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(theme::selected());
+
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(Some(app.errors_selected));
+        frame.render_stateful_widget(list, list_area, &mut state);
+    }
+
+    frame.render_widget(
+        Paragraph::new(Span::styled("↑/↓: move · Enter/Esc: back", theme::dim())).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Help")
+                .border_style(theme::dim()),
+        ),
+        footer_area,
     );
 }
 

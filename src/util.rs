@@ -103,7 +103,7 @@ pub fn file_id(path: &std::path::Path, _metadata: &std::fs::Metadata) -> Option<
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
-            0,
+            ptr::null_mut(),
         );
 
         if handle == INVALID_HANDLE_VALUE {

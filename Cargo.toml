@@ -2,7 +2,46 @@
 name = "scout"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
+anyhow = "1"
+thiserror = "1"
+dirs = "6.0.0"
 ratatui = "0.30.2"
 sled = "0.34.7"
+toml = "1.1.4"
+serde = { version = "1.0.229", features = ["derive"] }
+unicode-normalization = "0.1.25"
+ignore = "0.4"
+content_inspector = "0.2.4"
+serde_json = "1.0.151"
+tui-big-text = "0.8.8"
+time = { version = "0.3.54", features = ["formatting"] }
+opener = { version = "0.8.5", features = ["reveal"] }
+notify = "8.2.0"
+crossbeam-channel = "0.5.16"
+
+[dev-dependencies]
+tempfile = "3.14"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+# DENY PANICS
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+unchecked_time_subtraction = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+as_conversions = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

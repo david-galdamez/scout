@@ -850,7 +850,7 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, b"content").expect("failed to write test file");
         let fs_metadata = std::fs::metadata(&path).expect("failed to read test file metadata");
-        let id = file_id(&fs_metadata).expect("file_id should be available in tests");
+        let id = file_id(&path, &fs_metadata).expect("file_id should be available in tests");
         (path, id)
     }
 

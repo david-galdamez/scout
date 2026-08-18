@@ -22,7 +22,7 @@ fn resolve_doc_id(
     file_metadata: &std::fs::Metadata,
     db: &Database,
 ) -> Result<u64, DirErrors> {
-    let by_file_id = match file_id(file_metadata) {
+    let by_file_id = match file_id(path, file_metadata) {
         Some(id) => db.get_doc_id_by_file_id(id)?,
         None => None,
     };
@@ -78,7 +78,7 @@ pub fn process_text_file(path: &Path, db: &Database) -> Result<(), DirErrors> {
         &file_name,
         &counts,
         &file_name_tokens.into_iter().collect::<HashSet<String>>(),
-        file_id(&file_metadata),
+        file_id(path, &file_metadata),
     )?;
 
     Ok(())
@@ -112,7 +112,7 @@ pub fn process_binary_and_image_file(
         &metadata,
         &file_name,
         &file_name_tokens.into_iter().collect::<HashSet<String>>(),
-        file_id(&file_metadata),
+        file_id(path, &file_metadata),
     )?;
 
     Ok(())

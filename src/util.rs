@@ -47,13 +47,15 @@ impl FileId {
 // Returns `None` when the platform/filesystem can't provide a stable identifier (rare, but
 // possible on some Windows volumes); callers fall back to path-based detection in that case.
 // `Option` is always `Some` on Unix — kept for a signature shared with the fallible Windows
-// variant below, since callers are cfg-agnostic.
+// variant below, since callers are cfg-agnostic. Takes `path` alongside `metadata` because the
+// Windows variant needs to reopen the file itself (see below); Unix reads everything it needs
+// off `metadata`.
 #[cfg(unix)]
 #[expect(
     clippy::unnecessary_wraps,
     reason = "Option is required by the Windows variant of this cfg-gated function"
 )]
-pub fn file_id(metadata: &std::fs::Metadata) -> Option<FileId> {
+pub fn file_id(_path: &std::path::Path, metadata: &std::fs::Metadata) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
     Some(FileId {
         device: metadata.dev(),
@@ -61,16 +63,66 @@ pub fn file_id(metadata: &std::fs::Metadata) -> Option<FileId> {
     })
 }
 
+// `std::fs::Metadata` on Windows already carries the volume serial number and file index
+// internally (that's what `std::os::windows::fs::MetadataExt::volume_serial_number`/
+// `file_index` read), but those accessors are still gated behind the unstable
+// `windows_by_handle` feature — unusable on stable Rust. So instead of reading them off
+// `metadata`, this reopens `path` itself and asks Windows directly via
+// `GetFileInformationByHandle`, the same underlying API std uses. `dwDesiredAccess: 0` opens
+// a handle that can only be used to query metadata, not read/write the file's contents — the
+// same trick `std::fs::metadata` itself relies on, and it's why this doesn't need any actual
+// file permissions the OS-level walk hasn't already implied. `FILE_FLAG_BACKUP_SEMANTICS` is
+// required to open a directory handle at all, not just files.
 #[cfg(windows)]
-pub fn file_id(metadata: &std::fs::Metadata) -> Option<FileId> {
-    use std::os::windows::fs::MetadataExt;
-    Some(FileId {
-        device: u64::from(metadata.volume_serial_number()?),
-        file_index: metadata.file_index()?,
-    })
+pub fn file_id(path: &std::path::Path, _metadata: &std::fs::Metadata) -> Option<FileId> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+            OPEN_EXISTING,
+        },
+    };
+
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: `wide_path` is a valid null-terminated UTF-16 string for the duration of this
+    // call. `handle` is checked against `INVALID_HANDLE_VALUE` before being passed to
+    // `GetFileInformationByHandle`, and is always closed exactly once before returning.
+    unsafe {
+        let handle: HANDLE = CreateFileW(
+            wide_path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            0,
+        );
+
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let succeeded = GetFileInformationByHandle(handle, &raw mut info) != 0;
+        CloseHandle(handle);
+
+        succeeded.then(|| FileId {
+            device: u64::from(info.dwVolumeSerialNumber),
+            file_index: u64::from(info.nFileIndexHigh).wrapping_shl(32)
+                | u64::from(info.nFileIndexLow),
+        })
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn file_id(_metadata: &std::fs::Metadata) -> Option<FileId> {
+pub fn file_id(_path: &std::path::Path, _metadata: &std::fs::Metadata) -> Option<FileId> {
     None
 }

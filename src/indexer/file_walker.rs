@@ -345,7 +345,7 @@ fn index_state(
     let fs_metadata = std::fs::metadata(path)?;
     let current_modified = modified_secs(&fs_metadata);
 
-    if let Some(id) = file_id(&fs_metadata) {
+    if let Some(id) = file_id(path, &fs_metadata) {
         recover(visited_file_ids.lock()).insert(IVec::from(id.to_bytes().to_vec()));
         return Ok(match db.get_doc_id_by_file_id(id)? {
             None => IndexState::New,

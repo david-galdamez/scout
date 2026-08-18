@@ -1,7 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::mpsc::Sender,
-};
+use std::path::{Path, PathBuf};
 
 use ratatui::{layout::Rect, widgets::ListState};
 
@@ -362,7 +359,7 @@ pub struct App {
     pub config: Config,
     // `Some` only while `screen == Screen::Config`.
     pub config_draft: Option<ConfigDraft>,
-    config_tx: Sender<ConfigUpdate>,
+    config_tx: crossbeam_channel::Sender<ConfigUpdate>,
     // Per-file errors from the most recently finished walk, replaced wholesale on every
     // `IndexingEvent::Finished` (not accumulated — each walk's errors supersede the last).
     pub errors: Vec<(PathBuf, DirErrors)>,
@@ -370,7 +367,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(db: Database, config: Config, config_tx: Sender<ConfigUpdate>) -> Self {
+    pub fn new(
+        db: Database,
+        config: Config,
+        config_tx: crossbeam_channel::Sender<ConfigUpdate>,
+    ) -> Self {
         Self {
             db,
             query: String::new(),
